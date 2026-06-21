@@ -19,6 +19,7 @@
 
 static bool bStarted = false;
 static FHttpRouteHandle RewardRouteHandle = nullptr;
+static FHttpRouteHandle RenderRouteHandle = nullptr;
 static TSharedPtr<IHttpRouter> Router;
 
 int32 RenderService::GetPortFromArgs()
@@ -52,6 +53,18 @@ static void Respond(const FHttpResultCallback& OnComplete, EHttpServerResponseCo
 	OnComplete(MoveTemp(Resp));
 }
 
+// Respond with raw binary bytes and a caller-supplied Content-Type (e.g. PNG).
+static void RespondBytes(const FHttpResultCallback& OnComplete, EHttpServerResponseCodes Code,
+                         TArray<uint8> BodyBytes, const FString& ContentType)
+{
+	auto Resp = MakeUnique<FHttpServerResponse>(MoveTemp(BodyBytes));
+	Resp->Code = Code;
+	TArray<FString> Type;
+	Type.Add(ContentType);
+	Resp->Headers.Add(TEXT("Content-Type"), Type);
+	OnComplete(MoveTemp(Resp));
+}
+
 void RenderService::Start(int32 Port)
 {
 	FHttpServerModule& Module = FHttpServerModule::Get();
@@ -81,11 +94,11 @@ void RenderService::Start(int32 Port)
 				return true;
 			}
 
-			const FString OriginalPath = Body->GetStringField(TEXT("original"));
-			const FString CurrentPath = Body->GetStringField(TEXT("current"));
-			if (OriginalPath.IsEmpty() || CurrentPath.IsEmpty())
+			const FString OriginalObjText = Body->GetStringField(TEXT("original_obj"));
+			const FString CurrentObjText = Body->GetStringField(TEXT("current_obj"));
+			if (OriginalObjText.IsEmpty() || CurrentObjText.IsEmpty())
 			{
-				Respond(OnComplete, EHttpServerResponseCodes::BadRequest, TEXT("{\"error\":\"missing paths\"}"));
+				Respond(OnComplete, EHttpServerResponseCodes::BadRequest, TEXT("{\"error\":\"missing obj content\"}"));
 				return true;
 			}
 
@@ -96,7 +109,7 @@ void RenderService::Start(int32 Port)
 			// reports failures via OutError (empty = success).
 			float Reward = 0.0f;
 			FString Error;
-			Reward = MeshComparator::ComputeSimilarity(OriginalPath, CurrentPath, Error);
+			Reward = MeshComparator::ComputeSimilarity(OriginalObjText, CurrentObjText, Error);
 			bool bOk = Error.IsEmpty();
 
 			TSharedPtr<FJsonObject> RespJson = MakeShareable(new FJsonObject);
@@ -121,8 +134,57 @@ void RenderService::Start(int32 Port)
 		return;
 	}
 
+	// POST /render  {"obj": <obj text>, "width": int=1024, "height": int=1024}
+	//   -> 200 image/png (a single shaded 3/4 view of the mesh)
+	//   -> 200 application/json {"error": ...} on a bad mesh / render failure
+	RenderRouteHandle = Router->BindRoute(
+		FHttpPath(TEXT("/render")),
+		EHttpServerRequestVerbs::VERB_POST,
+		FHttpRequestHandler::CreateLambda([](const FHttpServerRequest& Request, const FHttpResultCallback& OnComplete) -> bool
+		{
+			FString BodyStr(UTF8_TO_TCHAR(Request.Body.GetData()));
+			TSharedPtr<FJsonObject> Body;
+			TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(BodyStr);
+			if (!FJsonSerializer::Deserialize(Reader, Body) || !Body.IsValid())
+			{
+				Respond(OnComplete, EHttpServerResponseCodes::BadRequest, TEXT("{\"error\":\"bad json\"}"));
+				return true;
+			}
+
+			const FString ObjText = Body->GetStringField(TEXT("obj"));
+			if (ObjText.IsEmpty())
+			{
+				Respond(OnComplete, EHttpServerResponseCodes::BadRequest, TEXT("{\"error\":\"missing obj content\"}"));
+				return true;
+			}
+			int32 Width = 1024;
+			int32 Height = 1024;
+			Body->TryGetNumberField(TEXT("width"), Width);
+			Body->TryGetNumberField(TEXT("height"), Height);
+
+			TArray<uint8> PngBytes;
+			FString Error;
+			bool bOk = MeshComparator::RenderMeshToPng(ObjText, Width, Height, PngBytes, Error);
+			if (!bOk)
+			{
+				TSharedPtr<FJsonObject> ErrJson = MakeShareable(new FJsonObject);
+				ErrJson->SetStringField(TEXT("error"), Error);
+				Respond(OnComplete, EHttpServerResponseCodes::Ok, BuildJsonResponse(ErrJson.ToSharedRef()));
+				return true;
+			}
+
+			RespondBytes(OnComplete, EHttpServerResponseCodes::Ok, MoveTemp(PngBytes), TEXT("image/png"));
+			return true;
+		}));
+
+	if (!RenderRouteHandle.IsValid())
+	{
+		UE_LOG(LogTemp, Error, TEXT("[AutoMeshRender] failed to bind /render route"));
+		return;
+	}
+
 	Module.StartAllListeners();
-	UE_LOG(LogTemp, Log, TEXT("[AutoMeshRender] HTTP service listening on 127.0.0.1:%d/reward"), Port);
+	UE_LOG(LogTemp, Log, TEXT("[AutoMeshRender] HTTP service listening on 127.0.0.1:%d/reward and /render"), Port);
 }
 
 void RenderService::Tick()
@@ -146,10 +208,18 @@ void RenderService::Stop()
 		return;
 	}
 	bStarted = false;
-	if (Router.IsValid() && RewardRouteHandle.IsValid())
+	if (Router.IsValid())
 	{
-		Router->UnbindRoute(RewardRouteHandle);
-		RewardRouteHandle = nullptr;
+		if (RewardRouteHandle.IsValid())
+		{
+			Router->UnbindRoute(RewardRouteHandle);
+			RewardRouteHandle = nullptr;
+		}
+		if (RenderRouteHandle.IsValid())
+		{
+			Router->UnbindRoute(RenderRouteHandle);
+			RenderRouteHandle = nullptr;
+		}
 	}
 	FHttpServerModule::Get().StopAllListeners();
 	Router.Reset();

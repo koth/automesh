@@ -9,13 +9,15 @@
 #include "MaterialDomain.h"
 #include "Components/SceneCaptureComponent2D.h"
 #include "UObject/ConstructorHelpers.h"
-#include "Misc/FileHelper.h"
-#include "Misc/Paths.h"
 #include "RenderResource.h"
 #include "RHI.h"
 #include "RHICommandList.h"
 #include "RHIDefinitions.h"
 #include "Async/Async.h"
+
+#include "IImageWrapper.h"
+#include "IImageWrapperModule.h"
+#include "Modules/ModuleManager.h"
 
 // ---------------------------------------------------------------------------
 // Camera setup: 6 views (cube-face). Fixed so they are reused across calls.
@@ -46,16 +48,13 @@ static TArray<FFixedCamera, TFixedAllocator<6>> MakeCameras(const FVector& Cente
 
 // ---------------------------------------------------------------------------
 // OBJ parsing: minimal Wavefront loader. Only v and f (triangulated). Matches
-// the subset automesh's io.py writes, so no need for a full parser.
+// the subset automesh's io.py writes (mesh_to_obj_string), so no need for a
+// full parser. Operates on an in-memory OBJ document; no filesystem access.
 // ---------------------------------------------------------------------------
-static bool ParseObj(const FString& Path, TArray<FVector>& OutVerts, TArray<int32>& OutTris, FString& OutError)
+static bool ParseObjFromString(const FString& ObjText, TArray<FVector>& OutVerts, TArray<int32>& OutTris, FString& OutError)
 {
 	TArray<FString> Lines;
-	if (!FFileHelper::LoadFileToStringArray(Lines, *Path))
-	{
-		OutError = FString::Printf(TEXT("cannot read OBJ: %s"), *Path);
-		return false;
-	}
+	ObjText.ParseIntoArrayLines(Lines);
 
 	for (const FString& Line : Lines)
 	{
@@ -275,14 +274,14 @@ static float CompareBuffers(const TArray<TArray<FColor>>& A,
 	return float(1.0 / (1.0 + Mse));
 }
 
-float MeshComparator::ComputeSimilarity(const FString& OriginalObjPath,
-                                        const FString& CurrentObjPath,
+float MeshComparator::ComputeSimilarity(const FString& OriginalObjText,
+                                        const FString& CurrentObjText,
                                         FString& OutError)
 {
 	TArray<FVector> OrigVerts, CurrVerts;
 	TArray<int32> OrigTris, CurrTris;
-	if (!ParseObj(OriginalObjPath, OrigVerts, OrigTris, OutError)) return 0.0f;
-	if (!ParseObj(CurrentObjPath, CurrVerts, CurrTris, OutError)) return 0.0f;
+	if (!ParseObjFromString(OriginalObjText, OrigVerts, OrigTris, OutError)) return 0.0f;
+	if (!ParseObjFromString(CurrentObjText, CurrVerts, CurrTris, OutError)) return 0.0f;
 
 	// Shared camera frame derived from the original mesh's bounds so both are
 	// rendered from identical viewpoints.
@@ -316,4 +315,133 @@ float MeshComparator::ComputeSimilarity(const FString& OriginalObjPath,
 		return 0.0f;
 	}
 	return CompareBuffers(OrigPixels, CurrPixels);
+}
+
+// ---------------------------------------------------------------------------
+// PNG encoding via the ImageWrapper module (stable across UE4/5). FColor is
+// BGRA in memory; the wrapper's ERGBFormat::BGRA matches it byte-for-byte.
+// ---------------------------------------------------------------------------
+static bool EncodePng(const TArray<FColor>& Pixels, int32 Width, int32 Height,
+                      TArray<uint8>& OutBytes, FString& OutError)
+{
+	if (Pixels.Num() != Width * Height)
+	{
+		OutError = TEXT("pixel count does not match width*height");
+		return false;
+	}
+
+	IImageWrapperModule& ImageWrapperModule = FModuleManager::LoadModuleChecked<IImageWrapperModule>(FName("ImageWrapper"));
+	TSharedPtr<IImageWrapper> PngWrapper = ImageWrapperModule.FindOrCreateImageWrapper(EImageFormat::PNG);
+	if (!PngWrapper.IsValid())
+	{
+		OutError = TEXT("PNG image wrapper unavailable");
+		return false;
+	}
+
+	// FColor layout in memory is B,G,R,A -> ERGBFormat::BGRA, 8 bits/channel.
+	if (!PngWrapper->SetRaw(Pixels.GetData(), Pixels.Num() * sizeof(FColor),
+	                        Width, Height, ERGBFormat::BGRA, 8))
+	{
+		OutError = TEXT("failed to set raw image data for PNG");
+		return false;
+	}
+
+	OutBytes = PngWrapper->GetCompressed(EImageCompressionQuality::Default);
+	return OutBytes.Num() > 0;
+}
+
+bool MeshComparator::RenderMeshToPng(const FString& ObjText,
+                                     int32 Width, int32 Height,
+                                     TArray<uint8>& OutPngBytes,
+                                     FString& OutError)
+{
+	Width = FMath::Clamp(Width, 1, 4096);
+	Height = FMath::Clamp(Height, 1, 4096);
+
+	TArray<FVector> Verts;
+	TArray<int32> Tris;
+	if (!ParseObjFromString(ObjText, Verts, Tris, OutError))
+	{
+		return false;
+	}
+
+	FBox Box(Verts);
+	FVector Center = Box.GetCenter();
+	float Radius = Box.GetExtent().Size();
+	if (Radius < KINDA_SMALL_NUMBER) Radius = 1.0f;
+
+	UObject* WorldCtx = GetTransientPackage();
+	AActor* MeshActor = SpawnMeshActor(WorldCtx, Verts, Tris);
+	if (!MeshActor)
+	{
+		OutError = TEXT("failed to spawn mesh actor");
+		return false;
+	}
+
+	// 3/4 perspective view: iso direction, auto-framed so the bounding sphere
+	// fits inside the FOV. Distance = Radius / sin(FOV/2) keeps the whole sphere
+	// on screen; we add 10% slack so edges aren't clipped by the near/far planes.
+	const float FovDeg = 45.0f;
+	const float FovRad = FMath::DegreesToRadians(FovDeg);
+	const float HalfSin = FMath::Max(KINDA_SMALL_NUMBER, FMath::Sin(FovRad * 0.5f));
+	const float Dist = (Radius / HalfSin) * 1.1f;
+
+	FVector Dir(1.0, 1.0, 1.0);
+	Dir.Normalize();
+	FVector CamPos = Center + Dir * Dist;
+	FRotator CamRot = FRotationMatrix::MakeFromX(-Dir).Rotator();
+
+	UWorld* World = MeshActor->GetWorld();
+	if (!World)
+	{
+		OutError = TEXT("no world to render in");
+		MeshActor->Destroy();
+		return false;
+	}
+
+	UTextureRenderTarget2D* RT = NewObject<UTextureRenderTarget2D>(
+		GetTransientPackage(), UTextureRenderTarget2D::StaticClass());
+	RT->RenderTargetFormat = RTF_RGBA8;
+	RT->InitAutoFormat(Width, Height);
+	RT->UpdateResourceImmediate(true);
+
+	AActor* CaptureActor = World->SpawnActor<AActor>(AActor::StaticClass());
+	USceneCaptureComponent2D* Capture = NewObject<USceneCaptureComponent2D>(CaptureActor);
+	Capture->SetupAttachment(CaptureActor->GetRootComponent());
+	Capture->RegisterComponent();
+	Capture->TextureTarget = RT;
+	// Final colour LDR (not depth): a visible shaded image of the mesh.
+	Capture->CaptureSource = ESceneCaptureSource::SCS_FinalColorLDR;
+	Capture->bCaptureEveryFrame = false;
+	Capture->bCaptureOnMovement = false;
+	Capture->FOVAngle = FovDeg;
+
+	CaptureActor->SetActorLocation(CamPos);
+	CaptureActor->SetActorRotation(CamRot);
+	Capture->ClipPlaneNormal = FVector::ZeroVector; // disable custom clip
+	Capture->CaptureScene();
+
+	TArray<FColor> Pixels;
+	FReadSurfaceDataFlags Flags(RCM_UNorm);
+	FlushRenderingCommands();
+	FRenderCommandFence Fence;
+	{
+		FTextureRenderTargetResource* RtRes = RT->GetRenderTargetResource();
+		ENQUEUE_RENDER_COMMAND(ReadRenderPixels)(
+			[RtRes, Width, Height, Flags, &Pixels](FRHICommandListImmediate& RHICmdList)
+		{
+			RHICmdList.ReadSurfaceData(
+				RtRes->TextureRHI,
+				FIntRect(0, 0, Width - 1, Height - 1),
+				Pixels,
+				Flags);
+		});
+	}
+	Fence.BeginFence();
+	Fence.Wait();
+
+	CaptureActor->Destroy();
+	MeshActor->Destroy();
+
+	return EncodePng(Pixels, Width, Height, OutPngBytes, OutError);
 }

@@ -11,12 +11,14 @@ The package is a small Python research scaffold. Layout:
   - `qem.py` — Quadric Error Metrics implementation and top-K candidate enumeration.
   - `env.py` — Gym-like `MeshSimplificationEnv` (reset/step API, legal actions).
   - `policies.py` — pluggable policies; current baselines are `qem-greedy` and `random`.
-  - `rewards.py` — reward providers, including geometry proxies and the `ExternalCommandReward` shell-out.
-  - `io.py` — Wavefront OBJ loader/saver.
-  - `cli.py` — `automesh` console entry point (`demo`, `simplify` subcommands).
+  - `rewards.py` — reward providers (`HttpRenderReward`, `ExternalCommandReward`, geometry proxies) plus `render_mesh_image` for the `/render` route; all serialize meshes as OBJ text in the body — no shared filesystem.
+  - `io.py` — Wavefront OBJ loader/saver, plus `mesh_to_obj_string`/`mesh_from_obj_string` for in-memory serialization used by the HTTP paths.
+  - `cli.py` — `automesh` console entry point (`demo`, `simplify`, `render-image` subcommands).
 - `tests/` — pytest suite: `test_qem_env.py`, `test_io.py`, `test_external_reward.py`.
-- `docs/ROADMAP.md` — milestone plan (M1–M5).
-- `out/` — generated artefacts (ignored by git).
+- `docs/ROADMAP.md` — milestone plan (M1–M5); `docs/UNREAL_SETUP.md` + `docs/AUTOMESH_RENDER_BUILD.md` — UE render-service setup/build.
+- `ue/AutoMeshRender/` — UE5 persistent HTTP render service (Editor target, `IHttpRouter`): `/reward` (6-view depth MSE) and `/render` (single 3/4 view → PNG). Run uncooked via `UnrealEditor -game -RenderOffScreen`.
+- `scripts/sample_thingi10k.py` — Thingi10K asset sampler for test meshes.
+- `datas/` — datasets (`Thingi10K.tar.gz`); `out/` — generated artefacts (both gitignored).
 - `pyproject.toml` — build metadata, dependencies, and pytest config.
 
 ## Build, Test, and Development Commands
@@ -30,6 +32,8 @@ pip install -e ".[dev]"
 pytest            # run the full test suite (testpaths configured in pyproject.toml)
 automesh demo --steps 4
 automesh simplify input.obj output.obj --target-faces 1000 --policy qem-greedy --top-k 16
+# render a mesh to PNG via the UE render service (/render route):
+automesh render-image input.obj out.png --endpoint http://127.0.0.1:8765/render
 ```
 
 `pip install -e ".[dev]"` exposes the `automesh` console script and pulls in `pytest`. CLI outputs land in `out/` by convention.
@@ -57,5 +61,5 @@ automesh simplify input.obj output.obj --target-faces 1000 --policy qem-greedy -
 ## Agent-Specific Instructions
 
 - Rebuild topology after each collapse is intentional for clarity — do not switch to half-edge without a roadmap note.
-- Keep reward providers pluggable; new visual rewards must stay out of the inner training loop and follow the `ExternalCommandReward` pattern when invoking external renderers.
+- Keep reward providers pluggable; visual rewards must stay out of the inner training loop. Prefer the verified `HttpRenderReward` + persistent UE service pattern (`ue/AutoMeshRender/`, see `docs/UNREAL_SETUP.md`) over per-call subprocesses; `ExternalCommandReward` remains for one-shot local renderers only.
 - Generated OBJ files belong in `out/` (gitignored); never commit them to `src/`.

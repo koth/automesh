@@ -7,6 +7,7 @@ from automesh.env import MeshSimplificationEnv
 from automesh.io import load_obj, save_obj
 from automesh.mesh import Mesh
 from automesh.policies import make_policy
+from automesh.rewards import render_mesh_image
 
 
 def main() -> None:
@@ -28,11 +29,25 @@ def main() -> None:
     simplify.add_argument("--max-steps", type=int, default=None)
     simplify.add_argument("--seed", type=int, default=0)
 
+    render_image = subparsers.add_parser(
+        "render-image",
+        help="render an OBJ to a PNG via the persistent UE render service",
+    )
+    render_image.add_argument("input", type=Path, help="input Wavefront OBJ")
+    render_image.add_argument("output", type=Path, help="output PNG path")
+    render_image.add_argument(
+        "--endpoint", default="http://127.0.0.1:8765/render", help="render service /render URL"
+    )
+    render_image.add_argument("--width", type=int, default=1024)
+    render_image.add_argument("--height", type=int, default=1024)
+
     args = parser.parse_args()
     if args.command == "demo":
         run_demo(args)
     elif args.command == "simplify":
         run_simplify(args)
+    elif args.command == "render-image":
+        run_render_image(args)
 
 
 def run_demo(args: argparse.Namespace) -> None:
@@ -57,6 +72,19 @@ def run_simplify(args: argparse.Namespace) -> None:
     rollout(env, policy=args.policy, max_steps=args.max_steps, seed=args.seed)
     save_obj(env.current, args.output)
     print(f"saved {args.output}")
+
+
+def run_render_image(args: argparse.Namespace) -> None:
+    mesh = load_obj(args.input)
+    png = render_mesh_image(
+        mesh,
+        endpoint=args.endpoint,
+        width=args.width,
+        height=args.height,
+    )
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    args.output.write_bytes(png)
+    print(f"saved {args.output} ({len(png)} bytes)")
 
 
 def rollout(env: MeshSimplificationEnv, policy: str, max_steps: int | None, seed: int | None = None) -> None:

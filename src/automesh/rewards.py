@@ -11,7 +11,7 @@ from typing import Protocol
 
 import numpy as np
 
-from automesh.io import save_obj
+from automesh.io import mesh_to_obj_string, save_obj
 from automesh.mesh import Mesh
 from automesh.qem import CollapseCandidate
 
@@ -163,14 +163,14 @@ class HttpRenderReward:
     this client assumes a long-running renderer -- e.g. a headless Unreal
     process listening on localhost -- that stays warm across calls. Each
     invocation is a single HTTP request, so GPU state, shaders, and camera
-    setup are reused. Meshes are exchanged by path on a shared filesystem,
-    never serialized over the wire.
+    setup are reused. Meshes are serialized into the request body as OBJ text,
+    so the service needs no shared filesystem access.
 
     Contract with the service:
 
         POST <endpoint>
         Content-Type: application/json
-        {"original": "/abs/original.obj", "current": "/abs/current.obj",
+        {"original_obj": "v ...\nf ...\n", "current_obj": "v ...\nf ...\n",
          "step": 123, "faces": 456}
 
         200 OK
@@ -187,7 +187,6 @@ class HttpRenderReward:
         interval: int = 100,
         weight: float = 1.0,
         timeout_seconds: float = 30.0,
-        shared_dir: str | Path | None = None,
         user_agent: str = "automesh-http-render-reward/0.1",
     ) -> None:
         if not endpoint:
@@ -196,60 +195,81 @@ class HttpRenderReward:
         self.interval = max(1, interval)
         self.weight = weight
         self.timeout_seconds = timeout_seconds
-        # When set, OBJ scratch files are written here (a volume shared with the
-        # render service) instead of a local tempdir, so the service can read them.
-        self.shared_dir = Path(shared_dir) if shared_dir is not None else None
         self.user_agent = user_agent
 
     def __call__(self, context: RewardContext) -> float:
         if not context.done and context.step_index % self.interval != 0:
             return 0.0
 
-        if self.shared_dir is not None:
-            self.shared_dir.mkdir(parents=True, exist_ok=True)
-            original_path = self.shared_dir / f"orig_{context.step_index}.obj"
-            current_path = self.shared_dir / f"curr_{context.step_index}.obj"
-            save_obj(context.original, original_path)
-            save_obj(context.current, current_path)
-            cleanup = None
-        else:
-            tmp = tempfile.TemporaryDirectory(prefix="automesh_reward_")
-            tmp_path = Path(tmp.name)
-            original_path = tmp_path / "original.obj"
-            current_path = tmp_path / "current.obj"
-            save_obj(context.original, original_path)
-            save_obj(context.current, current_path)
-            cleanup = tmp
-
+        payload = {
+            "original_obj": mesh_to_obj_string(context.original),
+            "current_obj": mesh_to_obj_string(context.current),
+            "step": context.step_index,
+            "faces": context.current.face_count,
+        }
+        data = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(
+            self.endpoint,
+            data=data,
+            headers={"Content-Type": "application/json", "User-Agent": self.user_agent},
+            method="POST",
+        )
         try:
-            payload = {
-                "original": str(original_path),
-                "current": str(current_path),
-                "step": context.step_index,
-                "faces": context.current.face_count,
-            }
-            data = json.dumps(payload).encode("utf-8")
-            req = urllib.request.Request(
-                self.endpoint,
-                data=data,
-                headers={"Content-Type": "application/json", "User-Agent": self.user_agent},
-                method="POST",
-            )
-            try:
-                with urllib.request.urlopen(req, timeout=self.timeout_seconds) as resp:
-                    if 200 <= resp.status < 300:
-                        body = resp.read()
-                    else:
-                        raise RuntimeError(f"render service returned HTTP {resp.status}")
-            except urllib.error.HTTPError as exc:
-                raise RuntimeError(f"render service returned HTTP {exc.code}") from exc
-            parsed = json.loads(body.decode("utf-8"))
-            reward = float(parsed["reward"])
-        finally:
-            if cleanup is not None:
-                cleanup.cleanup()
+            with urllib.request.urlopen(req, timeout=self.timeout_seconds) as resp:
+                if 200 <= resp.status < 300:
+                    body = resp.read()
+                else:
+                    raise RuntimeError(f"render service returned HTTP {resp.status}")
+        except urllib.error.HTTPError as exc:
+            raise RuntimeError(f"render service returned HTTP {exc.code}") from exc
+        parsed = json.loads(body.decode("utf-8"))
+        reward = float(parsed["reward"])
 
         return self.weight * reward
+
+
+def render_mesh_image(
+    mesh: Mesh,
+    endpoint: str = "http://127.0.0.1:8765/render",
+    width: int = 1024,
+    height: int = 1024,
+    timeout_seconds: float = 30.0,
+    user_agent: str = "automesh-http-render-reward/0.1",
+) -> bytes:
+    """Render a single mesh to a PNG via the persistent UE render service.
+
+    Mirrors the `HttpRenderReward` transport: serialize the mesh to OBJ text,
+    POST it to `/render`, and return the raw PNG bytes. On a non-2xx response
+    or a JSON error body this raises `RuntimeError`.
+    """
+    payload = {
+        "obj": mesh_to_obj_string(mesh),
+        "width": int(width),
+        "height": int(height),
+    }
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        endpoint,
+        data=data,
+        headers={"Content-Type": "application/json", "User-Agent": user_agent},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout_seconds) as resp:
+            if not (200 <= resp.status < 300):
+                raise RuntimeError(f"render service returned HTTP {resp.status}")
+            ctype = resp.headers.get("Content-Type", "")
+            body = resp.read()
+    except urllib.error.HTTPError as exc:
+        raise RuntimeError(f"render service returned HTTP {exc.code}") from exc
+    # The service returns image/png on success and application/json on error.
+    if "application/json" in ctype:
+        try:
+            err = json.loads(body.decode("utf-8")).get("error", "render failed")
+        except (ValueError, UnicodeDecodeError):
+            err = "render failed"
+        raise RuntimeError(f"render service error: {err}")
+    return body
 
 
 def default_reward() -> RewardProvider:

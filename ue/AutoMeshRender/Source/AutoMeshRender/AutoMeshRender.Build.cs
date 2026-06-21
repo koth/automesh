@@ -21,6 +21,7 @@ public class AutoMeshRender : ModuleRules
 			"JsonUtilities",
 			"Json",
 			"ProceduralMeshComponent",
+			"ImageWrapper",
 			"Slate",
 			"SlateCore",
 		});

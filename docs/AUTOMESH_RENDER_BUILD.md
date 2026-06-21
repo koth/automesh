@@ -39,21 +39,29 @@ test -f "$UBT" && echo "UBT ok" || echo "UBT missing — engine not built?"
 
 ---
 
-## 2. Build the project
+## 2. Build the project (Editor target)
 
-One command. UBT generates project files, compiles the `AutoMeshRender` module,
-and links the `AutoMeshRender` target defined in
-`Source/AutoMeshRender.Target.cs` (`Type = Game`).
+Build the **Editor target** (`AutoMeshRenderEditor`), not the Game target. The
+Editor target produces `libUnrealEditor-AutoMeshRender.so`, which the engine
+editor loads dynamically when you run uncooked in `-game` mode. The Game target
+(`AutoMeshRender.Target.cs`) only builds a cooked-mode standalone binary and is
+not used for development runs — see §5 for why.
 
 ```bash
-"$UBT" AutoMeshRender Linux Development -Project="$PROJ" -WaitMutex
+"$UBT" AutoMeshRenderEditor Linux Development -Project="$PROJ" -WaitMutex
+```
+
+Or via the helper script (sets UBT/PROJ for you):
+
+```bash
+./ue/AutoMeshRender/build.sh "$UE_ROOT" --target AutoMeshRenderEditor
 ```
 
 What each arg means:
 
 | Arg | Meaning |
 |---|---|
-| `AutoMeshRender` | target name = prefix of `AutoMeshRender.Target.cs` / class `AutoMeshRenderTarget` |
+| `AutoMeshRenderEditor` | target name = prefix of `Source/AutoMeshRenderEditor.Target.cs` / class `AutoMeshRenderEditorTarget` (`Type = Editor`) |
 | `Linux` | host platform (auto-detected, but explicit is safer) |
 | `Development` | config — must match engine config, **not Shipping** (Shipping drops runtime module support) |
 | `-Project=...` | path to this `.uproject`; without it UBT builds engine targets, not yours |
@@ -62,8 +70,8 @@ What each arg means:
 ### Expected output
 
 ```bash
-ls -la ue/AutoMeshRender/Binaries/Linux/AutoMeshRender
-# An executable, ~50-150 MB. If it's missing, the build failed — see §4.
+ls -la ue/AutoMeshRender/Binaries/Linux/libUnrealEditor-AutoMeshRender.so
+# A shared library. If it's missing, the build failed — see §4.
 ```
 
 Wall time: 5-15 min the first time (compiles the module + links against engine),
@@ -113,19 +121,22 @@ not the engine Makefile. Use the `"$UBT" ...` form in §2, not `make`.
 
 ### 4c. Include / type errors in `MeshComparator.cpp` or `RenderService.cpp`
 
-These are the expected failure points — the C++ was written against public UE5.4
-APIs but not compiled here. Most likely:
+These were the failure points during initial bring-up. All resolved against
+the real UE5.4 headers on the build host — the current code in-tree compiles.
+For reference, the corrections that were needed (in case of regressions):
 
-- `#include "SceneCaptureComponent2D.h"` path → try `Components/SceneCaptureComponent2D.h`
-- `#include "KismetProceduralMeshLibrary.h"` → try `Kismet/KismetProceduralMeshLibrary.h`
-- `FHttpRouteHandler` / `EHttpServerRequestVerbs` → `HttpServer` engine module API shift
-- `ReadSurfaceData` signature → render-thread read API
+- `#include "Components/SceneCaptureComponent2D.h"` (full path, not bare)
+- `#include "ProceduralMeshComponent.h"` and `#include "KismetProceduralMeshLibrary.h"` (no `Components/` or `Kismet/` prefix — they're at the `ProceduralMeshComponent` plugin's `Public/` root)
+- `#include "MaterialDomain.h"` for `EMaterialDomain` (forward-declared by `Material.h`)
+- `#include "Misc/CoreDelegates.h"` for `FCoreDelegates::OnEndFrame`
+- HTTP API: `FHttpServerModule::Get().GetHttpRouter(Port, bFailOnBindFailure)` → `IHttpRouter::BindRoute(...)`. No `IHttpServer`/`FHttpRouteHandler` in 5.4.
+- `UTextureRenderTarget2D::InitAutoFormat(W,H)` (not `Init`)
+- `UKismetProceduralMeshLibrary::CalculateTangentsForMesh(...)` (no `CalculateNormals`)
+- `ReadSurfaceData` on `FRHICommandListImmediate` via `ENQUEUE_RENDER_COMMAND`, pixels are `FColor`
+- `IMPLEMENT_PRIMARY_GAME_MODULE` (not `IMPLEMENT_MODULE`) for the primary game module
+- No C++ `try/catch` (UE disables exceptions) — use out-param error reporting
 
-Fix path: change the include to the full module-prefixed path UBT reports in the
-error (e.g. `Components/SceneCaptureComponent2D.h`), or add the module to
-`AutoMeshRender.Build.cs` `PrivateDependencyModuleNames` if the symbol comes
-from a module not yet depended on. See `ue/AutoMeshRender/README.md` §"Known
-compile-risk points" for the full list.
+Full verified-API list in `ue/AutoMeshRender/README.md` §"API notes".
 
 ### 4d. "module HTTPServer not found" / "Unable to find plugin 'HTTPServer'"
 
@@ -146,22 +157,48 @@ Engine is `Development`, project must be `Development` too. Don't pass
 
 ---
 
-## 5. After a successful build
+## 5. After a successful build — run uncooked via the editor
 
-Proceed to runtime verification (next stage, documented in
-`ue/AutoMeshRender/README.md` §Run / §Verify):
+Run with the **engine editor in `-game` mode**, not the Game-target binary.
+The editor loads uncooked content and compiles shaders online, so no
+`Content/` pak or cook step is needed. The Game-target binary runs in cooked
+mode and fatal-exits with "Failed to initialize ShaderCodeLibrary" or
+"No COOKED content was found" without a full packaging pass.
 
 ```bash
 xvfb-run -a -s "-screen 0 1280x720x24" \
-  ./ue/AutoMeshRender/Binaries/Linux/AutoMeshRender \
-  /abs/automesh/ue/AutoMeshRender/AutoMeshRender.uproject \
+  "$UE_ROOT/Engine/Binaries/Linux/UnrealEditor" \
+  "$PROJ" \
   -game -RenderOffScreen -NoLoadStartupPackages -Unattended -NoSplash -NoPause \
-  -windowed -resx=1 -resy=1 -RenderServicePort=8765 &
+  -windowed -resx=1 -resy=1 -RenderServicePort=8765 -log &
 
-# then:
+# wait for: [AutoMeshRender] HTTP service listening on 127.0.0.1:8765/reward and /render
+# (first run spends a few minutes compiling shaders; fast once DDC is warm)
+
+# then verify the endpoint (mesh content travels in the body):
 curl -s -X POST http://127.0.0.1:8765/reward \
   -H 'Content-Type: application/json' \
-  -d '{"original":"/shared/o.obj","current":"/shared/c.obj","step":0,"faces":0}'
+  -d "$(python3 -c 'import json;print(json.dumps({"original_obj":"v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n","current_obj":"v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n","step":0,"faces":1}))')"
+# -> {"reward": 1.0...}  (identical meshes)
+
+# /render returns a PNG (single 3/4 view, 1024x1024 by default):
+curl -s -X POST http://127.0.0.1:8765/render \
+  -H 'Content-Type: application/json' \
+  -d "$(python3 -c 'import json;print(json.dumps({"obj":"v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n","width":1024,"height":1024}))')" \
+  -o /tmp/mesh.png
+file /tmp/mesh.png   # -> PNG image data, 1024 x 1024
 ```
 
+### Why not the Game binary
+
+The Game target (`AutoMeshRender.Target.cs`, `Type = Game`) builds a standalone
+executable that runs in **cooked mode**: it expects packaged `Content/`
+(shader library paks, cooked assets). Two config items mitigate the shader
+library init but only the editor fully avoids it:
+- `Config/DefaultGame.ini` sets `bShareMaterialShaderCode=False` under
+  `[/Script/UnrealEd.ProjectPackagingSettings]` — the `bArchive` flag read by
+  `FShaderCodeLibrary::InitForRuntime`.
+- Cooking needs `UnrealPak`/Project Launcher; skip it in dev by using the editor.
+
 Build-time work is done here; runtime errors are a separate debugging pass.
+See `ue/AutoMeshRender/README.md` §Run / §Verify for the canonical commands.

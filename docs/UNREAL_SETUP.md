@@ -1,22 +1,25 @@
 # Unreal Engine Reward Setup (Ubuntu, headless, NVIDIA 8-16GB)
 
-Goal: build a **headless UE5 commandlet** that the existing `ExternalCommandReward`
-in `src/automesh/rewards.py` can call as a sparse photoreal reward (Roadmap M4).
+Goal: run a **persistent headless UE5 render service** on the training box,
+and call it from `HttpRenderReward` in `src/automesh/rewards.py` over HTTP as
+the sparse photoreal reward (Roadmap M4). The service is implemented in
+`ue/AutoMeshRender/` (in this repo).
 
-The contract from `ExternalCommandReward.__call__` is fixed and drives every
-decision below:
+The contract between client and service:
 
-- Input: two OBJ paths passed via a templated command line:
-  `{original}`, `{current}`, `{step}`, `{faces}`.
-- Output: the **last line of stdout must be a single float** (similarity reward).
-- Failure mode: any non-zero exit or timeout (>300s default) raises and aborts
-  the training step, so the commandlet must be robust and self-contained.
-- Only mesh paths are exchanged. Cameras, materials, lighting, and the loss
-  are all owned by the UE side.
+- **Request**: `POST <endpoint>`, `Content-Type: application/json`,
+  body `{"original_obj": <obj text>, "current_obj": <obj text>, "step": int, "faces": int}`.
+  Meshes are serialized as OBJ text in the body — no shared filesystem needed.
+- **Response**: `200` with `{"reward": <float>}`. A non-2xx or malformed body
+  raises and aborts the training step.
+- **Mesh scope**: only the two OBJ documents are exchanged. Cameras, materials,
+  lighting, and the loss live entirely in the UE service.
+- **Persistence**: the service stays warm across calls; each reward is one HTTP
+  request (tens of ms), not a process cold start. This is why we use
+  `HttpRenderReward`, not `ExternalCommandReward` (subprocess per call).
 
-> Scope note: this document covers the Unreal side. nvdiffrast/PyTorch3D for
-> the dense render-aware reward (M2) is a separate, lighter path described in
-> `docs/ROADMAP.md`.
+> Scope note: nvdiffrast/PyTorch3D for the dense render-aware reward (M2) is a
+> separate, lighter path described in `docs/ROADMAP.md`.
 
 ---
 
@@ -86,12 +89,13 @@ cd UE5
 
 ### Headless build (no editor GUI, smaller, faster to iterate)
 
-On a remote server you want the editor built as a commandlet host. Build it in
-**`Development`**, not `Shipping` — Shipping drops commandlet/automation support
-and is useless for the service host. The generated Makefile's *default* target is
-not reliable across environments (on some setups it builds `Shipping`), so call
-the Unreal Build Tool directly to pin the configuration. `Build.sh` is what the
-Makefile calls under the hood, and its target/config arguments are stable:
+On a remote server you want the editor built as a service host. Build it in
+**`Development`**, not `Shipping` — Shipping drops automation/development
+support and is useless for the service host. The generated Makefile's *default*
+target is not reliable across environments (on some setups it builds
+`Shipping`), so call the Unreal Build Tool directly to pin the configuration.
+`Build.sh` is what the Makefile calls under the hood, and its target/config
+arguments are stable:
 
 ```bash
 # From the UE5 root (after Setup.sh + GenerateProjectFiles.sh):
@@ -148,195 +152,153 @@ export UE_EDITOR="$HOME/ue/UE5/Engine/Binaries/Linux/UnrealEditor"
 
 ---
 
-## 3. Create the reward project + OBJ-import commandlet
+## 3. The render service project (`ue/AutoMeshRender/`)
 
-This is the bridge between `ExternalCommandReward` and UE. Create a blank C++
-project, then add a commandlet that:
+The service is already implemented in this repo under `ue/AutoMeshRender/`.
+It is a persistent UE5 module (not a per-call commandlet) that:
 
-1. Parses `-original=<path>` `-current=<path>` from the command line.
-2. Imports both OBJ files into ProceduralMeshComponents.
-3. Renders each from N fixed cameras to render targets.
-4. Reads back pixels, computes a similarity metric (start with MSE / SSIM, upgrade to LPIPS later).
-5. Prints a single float to stdout and exits 0.
-
-### Scaffold the project
-
-From the UE editor build (still headless, via commandlet):
-
-```bash
-$UE_EDITOR /path/to/AutoMeshReward/AutoMeshReward.uproject \
-  -run=GenerateProjectFiles -RenderOffScreen
-```
-
-Or create the `.uproject` + `Source/` tree by hand following the
-`AutoMeshReward` layout below.
+1. Starts an HTTP listener on `127.0.0.1:<port>` from `StartupModule` (via
+   `FCoreDelegates::OnEndFrame`, once the game viewport exists).
+2. On `POST /reward`, parses `{"original_obj","current_obj","step","faces"}`,
+   renders each mesh from 6 fixed cube-face cameras into a 512² depth RT,
+   and returns `{"reward": 1/(1+MSE_depth)}`.
+3. On `POST /render`, parses `{"obj","width","height"}`, renders the single
+   mesh from one auto-framed 3/4 camera into a 1024² colour RT, and returns
+   the PNG bytes (`Content-Type: image/png`).
 
 ### Project layout
 
 ```
-AutoMeshReward/
-├── AutoMeshReward.uproject
+ue/AutoMeshRender/
+├── AutoMeshRender.uproject              module decl (HTTPServer is an engine module, not a plugin)
 ├── Source/
-│   └── AutoMeshReward/
-│       ├── AutoMeshReward.Build.cs
-│       ├── AutoMeshReward.cpp            # module impl
-│       └── RewardCommandlet.cpp          # the bridge
-└── Config/
-    └── DefaultEngine.ini                 # disable Lumen/Nanite/RT
+│   ├── AutoMeshRenderEditor.Target.cs   Editor target — BUILD THIS (Type=Editor)
+│   ├── AutoMeshRender.Target.cs         Game target ��� cooked-only, not used in dev
+│   └── AutoMeshRender/
+│       ├── AutoMeshRender.Build.cs      deps: HTTPServer, Json, ProceduralMeshComponent, ...
+│       ├── AutoMeshRender.cpp           IMPLEMENT_PRIMARY_GAME_MODULE + OnEndFrame hook
+│       ├── RenderService.cpp            HTTP listener (IHttpRouter) + /reward and /render routes
+│       └── MeshComparator.cpp           OBJ parse → ProceduralMesh; /reward: 6-view depth→MSE; /render: 3/4 view→PNG
+├── Config/
+│   ├── DefaultEngine.ini                VRAM caps (512 RT, no Lumen/Nanite/RT)
+│   └── DefaultGame.ini                  bShareMaterialShaderCode=False (shader lib off)
+├── build.sh                             build helper (takes UE_ROOT, --target, --config)
+└── README.md                            full build/run/verify + verified API notes
 ```
 
-### RewardCommandlet.cpp (minimal skeleton)
-
-```cpp
-// Reads two OBJs, renders both from fixed cameras, prints similarity float.
-// This is intentionally minimal — flesh out the import + render loops.
-
-#include "Commandlets/Commandlet.h"
-#include "Misc/CommandLine.h"
-#include "Misc/Paths.h"
-
-DECLARE_LOG_CATEGORY_CLASS(LogRewardCmdlet, Log, All);
-
-class URewardCommandlet : public UCommandlet
-{
-    GENERATED_BODY()
-public:
-    URewardCommandlet() { LogToConsole = true; IsClient = false; IsEditor = true; }
-
-    virtual int32 Main(const FString& Params) override
-    {
-        // Parse: -original=<abs path> -current=<abs path> -out=<csv path>
-        FString OriginalPath = FParse::Token(*Params, false);
-        // ...strip "-original=" prefix, repeat for current, out
-
-        UE_LOG(LogRewardCmdlet, Display, TEXT("original=%s current=%s"), *OriginalPath, *CurrentPath);
-
-        // 1. Import OBJs into ProceduralMeshComponents.
-        // 2. Set up 6 fixed cameras (cube-face or fixed turntable).
-        // 3. Render each to a UTextureRenderTarget2D (512x512).
-        // 4. Read back FColor arrays via ReadSurfaceData.
-        // 5. Compute similarity = 1 / (1 + mean(|orig - curr|^2)).
-        float Similarity = 0.0f; // <-- replace with real metric
-
-        // CRITICAL: the automesh side reads the LAST line of stdout as a float.
-        fprintf(stdout, "%f\n", Similarity);
-        fflush(stdout);
-        return 0;  // non-zero exit aborts the training step
-    }
-};
-```
-
-### DefaultEngine.ini (VRAM + headless guards)
-
-```ini
-[SystemSettings]
-r.Shadow.MaxResolution=512
-r.TextureStreaming=True
-r.Streaming.PoolSize=2048
-r.Lumen.ScreenProbeGather.TracingOctahedronResolution=8
-r.Nanite.Enabled=False
-r.RayTracing=False
-r.AntiAliasingMethod=0
-r.RenderTargetViewportSize=512
-```
+Build and run instructions are in `docs/AUTOMESH_RENDER_BUILD.md` (§2 build,
+§5 run). The README's "API notes" section lists every UE5.4 API the code uses,
+all verified against the actual engine headers on the build host.
 
 ---
 
-## 4. Invocation via ExternalCommandReward
+## 4. Build and run the AutoMeshRender service
 
-Wire it up from Python. The template placeholders `{original}` `{current}`
-`{step}` `{faces}` are filled in by `ExternalCommandReward` automatically.
+The render service lives in `ue/AutoMeshRender/` (in the automesh repo). It is a
+**persistent HTTP server** run via the engine editor in `-game` mode — NOT a
+per-call subprocess. Build and run instructions are in
+`docs/AUTOMESH_RENDER_BUILD.md` and `ue/AutoMeshRender/README.md`; the short
+version:
+
+```bash
+# Build the Editor target (produces libUnrealEditor-AutoMeshRender.so):
+./ue/AutoMeshRender/build.sh "$UE_ROOT" --target AutoMeshRenderEditor
+
+# Run the persistent service (editor -game, uncooked, headless):
+xvfb-run -a -s "-screen 0 1280x720x24" \
+  "$UE_ROOT/Engine/Binaries/Linux/UnrealEditor" \
+  "$PROJ" \
+  -game -RenderOffScreen -NoLoadStartupPackages -Unattended -NoSplash -NoPause \
+  -windowed -resx=1 -resy=1 -RenderServicePort=8765 -log
+# wait for: [AutoMeshRender] HTTP service listening on 127.0.0.1:8765/reward and /render
+```
+
+Key point: use the **editor** (`UnrealEditor -game`), not the Game-target
+binary. The editor loads uncooked content and compiles shaders online; the
+Game binary runs in cooked mode and fatal-exits without a full packaging pass.
+
+### Wire it into the training loop
+
+From Python, call the warm service over HTTP via `HttpRenderReward` (not
+`ExternalCommandReward` — that cold-starts a subprocess per call):
 
 ```python
-from automesh.rewards import ExternalCommandReward
+from automesh.rewards import HttpRenderReward
 
-ue_reward = ExternalCommandReward(
-    command=[
-        "xvfb-run", "-a", "-s", "-screen 0 1280x720x24",
-        "$UE_EDITOR",
-        "/abs/path/AutoMeshReward/AutoMeshReward.uproject",
-        "-run=RewardCommandlet",
-        "-original={original}",
-        "-current={current}",
-        "-step={step}",
-        "-faces={faces}",
-        "-RenderOffScreen",
-        "-NoLoadStartupPackages",
-        "-NoShaderCompile",
-        "-Unattended",
-        "-NoPause",
-        "-NoSplash",
-        "-ExitUponCompletion",
-    ],
-    interval=100,        # sparse: only every 100 steps
+ue_reward = HttpRenderReward(
+    endpoint="http://127.0.0.1:8765/reward",
+    interval=100,          # sparse: only every 100 steps
     weight=1.0,
-    timeout_seconds=300, # matches default; bump if first-run shader compile is slow
+    timeout_seconds=30.0,  # warm call is tens of ms; 30s is a safety net
 )
 ```
 
-### Why each flag
+`HttpRenderReward` serializes both meshes to OBJ text with `mesh_to_obj_string`,
+POSTs them in the body, and scales the returned float by `weight`. No shared
+volume is required — the meshes travel in the request. Because the service is
+warm, `timeout_seconds` drops from 300s (subprocess) to 30s.
 
-| Flag | Reason |
-|---|---|
-| `xvfb-run -a` | Headless server has no X; UE needs a display for some GPU init paths. |
-| `-run=RewardCommandlet` | Invokes our bridge; replaces the editor event loop. |
-| `-RenderOffScreen` | No window/SwapChain; required for SSH. |
-| `-NoLoadStartupPackages` | Faster cold start; our commandlet loads only what it needs. |
-| `-NoShaderCompile` | Avoids 5-10 min first-run stall. **Pre-compile shaders first** (section 6). |
-| `-Unattended` `-NoPause` `-NoSplash` | No dialogs/prompts that would hang a subprocess. |
-| `-ExitUponCompletion` | Ensures the process terminates so `subprocess.run` returns. |
+To render a single mesh to a PNG (for inspection / paper figures), use the
+`/render` route — either `render_mesh_image(mesh, endpoint=...)` from Python or
+the CLI:
+
+```bash
+automesh render-image input.obj out.png --endpoint http://127.0.0.1:8765/render
+# out.png is a 1024x1024 shaded 3/4 view of the mesh
+```
 
 ---
 
 ## 5. First-run sanity checks (do these before training)
 
-Each check should be run standalone and produce the expected output before
-chaining them.
-
 ```bash
-# 1. Editor launches headless and exits cleanly.
-xvfb-run -a -s "-screen 0 1280x720x24" \
-  $UE_EDITOR /abs/path/AutoMeshReward/AutoMeshReward.uproject \
-  -RenderOffScreen -NoLoadStartupPackages -ExitUponCompletion
+# 1. Service is up and answering. Mesh content travels in the body.
+curl -s -X POST http://127.0.0.1:8765/reward \
+  -H 'Content-Type: application/json' \
+  -d "$(python3 -c 'import json;print(json.dumps({"original_obj":"v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n","current_obj":"v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n","step":0,"faces":1}))')"
+# Expect: {"reward": <float>}  (1.0 for identical meshes)
 
-# 2. Commandlet runs and prints a float on stdout.
-xvfb-run -a -s "-screen 0 1280x720x24" \
-  $UE_EDITOR /abs/path/AutoMeshReward/AutoMeshReward.uproject \
-  -run=RewardCommandlet \
-  -original=/abs/original.obj -current=/abs/current.obj \
-  -RenderOffScreen -Unattended -ExitUponCompletion
-# Expect last stdout line: 0.000000 (or whatever the metric returns)
+# 2. /render returns a PNG of a single 3/4 view (default 1024x1024).
+curl -s -X POST http://127.0.0.1:8765/render \
+  -H 'Content-Type: application/json' \
+  -d "$(python3 -c 'import json;print(json.dumps({"obj":"v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n","width":1024,"height":1024}))')" \
+  -o /tmp/mesh.png
+file /tmp/mesh.png   # Expect: PNG image data, 1024 x 1024
 
-# 3. Python bridge end-to-end with a tiny synthetic reward command.
-python -c "
-from automesh.rewards import ExternalCommandReward
+# 3. End-to-end from Python with the real class.
+python - <<'PY'
+from automesh.rewards import HttpRenderReward
 from automesh.mesh import Mesh
-from automesh.qem import CollapseCandidate
-r = ExternalCommandReward(command=['echo', '0.42'], interval=1, weight=1.0)
-# Minimal context (construct directly for the smoke test)
-print('ok' if r.__call__ else 'fail')
-"
+r = HttpRenderReward(endpoint="http://127.0.0.1:8765/reward", interval=1)
+# build a RewardContext and call r(ctx) to confirm the full path
+print("client ready")
+PY
 ```
 
 ---
 
-## 6. Shader precompile (avoids first-call OOM/timeout)
+## 6. Shader warm-up (persistent service)
 
-The first time the commandlet renders, UE compiles shaders for the GPU. On a
-cold cache this takes 5-10 minutes and can blow the 300s `timeout_seconds`.
-Pre-populate the DerivedDataCache once:
+Because the service runs as a **persistent** editor process (not a per-call
+subprocess), shaders compile on the first few reward calls and then stay warm
+in the DDC — there is no per-call cold start and no 300s timeout to blow. The
+first `curl /reward` after startup may take a few minutes while the engine
+compiles the depth-capture shaders for the GPU; subsequent calls reuse them.
+
+To pre-warm before training, just send one throwaway request after startup and
+let it finish:
 
 ```bash
-xvfb-run -a -s "-screen 0 1280x720x24" \
-  $UE_EDITOR /abs/path/AutoMeshReward/AutoMeshReward.uproject \
-  -run=ShaderCompile -RenderOffScreen -NoLoadStartupPackages -ExitUponCompletion
+curl -s -X POST http://127.0.0.1:8765/reward \
+  -H 'Content-Type: application/json' \
+  -d "$(python3 -c 'import json;print(json.dumps({"original_obj":"v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n","current_obj":"v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n","step":0,"faces":1}))')"
+# first call slow (shader compile), later calls tens of ms
 ```
 
-After this, `-NoShaderCompile` in the reward invocation is safe. Point the DDC
-at a shared on-disk path in `DefaultEngine.ini`:
+Point the DDC at a shared on-disk path in `DefaultEngine.ini` so compiles
+persist across service restarts:
 
 ```ini
-[Core.Log]
 [DerivedDataCache]
 StaticPaths="/path/to/ddc"
 ```
@@ -361,322 +323,33 @@ If you still OOM: drop to 256x256, 4 views, and ensure no other GPU process
 
 ## 8. Iteration tips
 
-- **Keep OBJ import minimal**: ProceduralMeshComponent, no material slots, no UVs. The reward only cares about silhouette/depth/normal, not textures.
-- **Log to stderr, float to stdout**: UE_LOG goes to the editor log, not stdout. Use `fprintf(stdout, ...)` + `fflush` for the reward value only. Anything else will confuse `ExternalCommandReward`'s "last line = float" parse.
-- **Cache camera matrices** in the commandlet; don't recompute per call.
-- **One process per call is expensive**: 10-20s UE startup per reward call is normal. That's why `interval=100` is the default — sparse by design. If startup dominates, consider a persistent UE process + a socket/pipe bridge (a future enhancement, not needed for M4 validation).
-- **Use `--no-weld` on the automesh sampling script** when feeding meshes to UE: UE's OBJ importer does its own welding; double-welding wastes time.
+- **Keep OBJ import minimal**: `ProceduralMeshComponent`, no material slots, no
+  UVs. The reward only cares about silhouette/depth/normal, not textures.
+- **stdout discipline**: UE_LOG goes to the editor log, not stdout. Only the
+  HTTP response body carries the reward, so `HttpRenderReward` parsing stays
+  clean — do not print the float to stdout.
+- **Cache camera matrices** in the service at startup; don't recompute per call.
+- **Mesh transport**: OBJ text travels in the request body (`original_obj` /
+  `current_obj`), so client and service need no shared volume. This means the
+  service can run on a different host than training with no NFS setup; just
+  point `endpoint` at the remote box. Keep meshes modest in size — a very dense
+  mesh makes for a large JSON payload, and `interval=100` keeps that rare.
+- **Failure isolation**: a bad mesh that crashes the comparator should be caught
+  inside the service and returned as HTTP 500, not propagated to kill training.
+  `HttpRenderReward` raises on non-2xx, so prefer catch-and-500 inside the
+  service for known-bad inputs and reserve hard crashes for truly unexpected
+  state.
+- **Use `--no-weld` on the automesh sampling script** when feeding meshes to UE:
+  UE's OBJ importer does its own welding; double-welding wastes time.
 
 ---
 
 ## 9. What this unblocks in the roadmap
 
-- **M4 (Sparse Photoreal Reward)**: `ExternalCommandReward` now has a real backend. Replace `PhotorealRewardStub` usage with the UE commandlet wired as in section 4.
-- **M5 (Evaluation)**: the same commandlet, invoked directly (not via the reward hook), can render final simplified meshes for paper figures. Add a `--save-images` mode to the commandlet for batch evaluation runs.
-# Unreal Engine Reward Setup (Ubuntu, headless, NVIDIA 8-16GB)
-
-Goal: run a **persistent headless UE5 render service** on the training box,
-and call it from `HttpRenderReward` in `src/automesh/rewards.py` over HTTP as
-the sparse photoreal reward (Roadmap M4).
-
-## Architecture
-
-```
-  automesh training loop (Python)
-       │  every N steps (interval=100)
-       ▼
-  HttpRenderReward  (urllib POST, stdlib only)
-       │  body: {"original": "/shared/orig_100.obj", "current": "/shared/curr_100.obj",
-       │         "step": 100, "faces": 456}
-       ▼  127.0.0.1 HTTP  (single call, tens of ms)
-  UE5 render service  (persistent process, GPU stays warm)
-       │  load OBJ → 6 fixed cameras → render targets → similarity metric
-       ▼
-  {"reward": 0.83}
-```
-
-### Why not `ExternalCommandReward` (subprocess per call)
-
-`ExternalCommandReward` does `subprocess.run` on every call. Applied to UE that
-means a cold process + shader/GPU init + Xvfb spin-up **per reward call**
-(10-20s each), and it contradicts "the renderer is a service". `HttpRenderReward`
-instead assumes a long-running renderer; each reward is one HTTP request, so GPU
-state, shaders, and camera setup are reused and the 300s cold-start timeout trap
-disappears entirely.
-
-The contract between client and service:
-
-- **Request**: `POST <endpoint>`, `Content-Type: application/json`,
-  body `{"original": <abs path>, "current": <abs path>, "step": int, "faces": int}`.
-  Meshes are exchanged **by path on a shared filesystem** (same box), never
-  serialized over the wire.
-- **Response**: `200` with `{"reward": <float>}`. A non-2xx or malformed body
-  raises and aborts the training step (strict failure, same as the subprocess path).
-- **Mesh scope**: only mesh paths are exchanged. Cameras, materials, lighting,
-  and the loss live entirely in the UE service.
-
-> Scope note: nvdiffrast/PyTorch3D for the dense render-aware reward (M2) is a
-> separate, lighter path described in `docs/ROADMAP.md`.
-
----
-
-## 0. Prerequisites & hardware guardrails
-
-| Item | Requirement | Your env |
-|---|---|---|
-| OS | Ubuntu 22.04 LTS (20.04 ok, 24.04 not yet UE-validated) | ✅ assumed |
-| GPU | NVIDIA, proprietary driver ≥ 535, CUDA 12.x | 8-16GB |
-| Disk | **~150 GB free** (UE source ~40GB, builds + DDC ~100GB) | verify first |
-| RAM | ≥ 32 GB recommended (linker peak) | verify |
-| Network | GitHub + Epic Games; GitHub account linked to Epic for UE source | required |
-
-**8-16GB VRAM constraints** (defaults will OOM):
-
-- Disable hardware **Lumen** GI; use baked/stationary lighting or Skylight only.
-- Disable **Nanite** on imported meshes (also fights OBJ import).
-- Render targets: start at **512x512, 6 views**. 1024^2 only with VRAM headroom.
-- `r.Shadow.MaxResolution 512`, ray tracing off.
-- `r.TextureStreaming=1`, pool size ≥ 2048.
-
----
-
-## 1. System packages
-
-Xvfb is still needed: the persistent UE service runs `-RenderOffScreen`, but some
-GPU init paths still want a display present.
-
-```bash
-sudo apt update
-sudo apt install -y \
-  build-essential clang git git-lfs curl wget unzip p7zip-full \
-  xorg xvfb libxrandr-dev libx11-dev libxcursor-dev libxinerama-dev \
-  libxi-dev libgl1-mesa-dev libglu1-mesa-dev libasound2-dev libfreetype6-dev \
-  libfontconfig1-dev libssl-dev libudev-dev libpulse-dev \
-  nvidia-driver-535 nvidia-utils-535
-nvidia-smi   # must show the GPU + driver 535.x / CUDA 12.x
-```
-
----
-
-## 2. Clone and build UE5 from source
-
-Needs an Epic account with GitHub linked (https://github.com/EpicGames/UnrealEngine).
-Use a release tag, not `master`.
-
-```bash
-mkdir -p ~/ue && cd ~/ue
-git clone -b 5.4 --depth 1 https://github.com/EpicGames/UnrealEngine.git UE5
-cd UE5
-./Setup.sh                 # ~20GB binary deps
-./GenerateProjectFiles.sh
-./Engine/Build/BatchFiles/Linux/Build.sh \
-    UnrealEditor Linux Development -WaitMutex   # 20-40 min
-export UE_EDITOR="$HOME/ue/UE5/Engine/Binaries/Linux/UnrealEditor"
-
-# sanity: launches headless. -version does NOT self-exit (full editor event loop),
-# so wrap in timeout; success = version line printed + clean 60s timeout kill.
-timeout 60 $UE_EDITOR -version -RenderOffScreen -NoLoadStartupPackages 2>&1 | tee /tmp/ue_version.log
-grep -i "engine version\|UnrealEngine" /tmp/ue_version.log | head
-```
-
-Build **`Development`** explicitly, **not `Shipping`** — Shipping drops
-commandlet/automation support that the service host relies on. The generated
-Makefile's default target is environment-dependent (it may be `Shipping`), so
-pin the config via `Build.sh`'s positional `<Target> <Platform> <Configuration>`
-args as shown above. Do not pass `TargetPlatform=`, `Development Editor`, or
-invented targets like `UE5Editor` — they all trigger "No rule to make target".
-
----
-
-## 3. Build the render service project
-
-Create a blank C++ project with two pieces:
-
-1. A **mesh import + render + metric** core (same logic as the old commandlet).
-2. An **HTTP listener** that accepts `POST /reward`, runs the core, returns
-   `{"reward": <float>}`.
-
-### Project layout
-
-```
-AutoMeshRender/
-├── AutoMeshRender.uproject
-├── Source/AutoMeshRender/
-│   ├── AutoMeshRender.Build.cs
-│   ├── AutoMeshRender.cpp
-│   ├── RenderService.cpp        # HTTP listener + request loop
-│   └── MeshComparator.cpp       # OBJ import → 6 cameras → similarity
-└── Config/DefaultEngine.ini
-```
-
-### RenderService.cpp (minimal listener skeleton)
-
-UE has no built-in HTTP *server*, so embed a tiny one. The example below uses
-the shipped `HttpServerModule` (available since UE 5.0):
-
-```cpp
-#include "HttpServerModule.h"
-#include "Interfaces/IHttpServer.h"
-#include "Dom/JsonObject.h"
-#include "Serialization/JsonReader.h"
-#include "Serialization/JsonSerializer.h"
-
-void StartRenderService(int32 Port)
-{
-    IHttpServer& Server = FHttpServerModule::Get().GetServer();
-
-    Server.AddRoute(TEXT("/reward"), EHttpServerRequestVerbs::VERB_POST,
-        [](const FHttpServerRequest& Req, const FHttpResultCallback& OnComplete) {
-            // Parse JSON body: { original, current, step, faces }
-            TSharedPtr<FJsonObject> Body;
-            TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(Req.Body);
-            FJsonSerializer::Deserialize(Reader, Body);
-
-            const FString OriginalPath = Body->GetStringField(TEXT("original"));
-            const FString CurrentPath  = Body->GetStringField(TEXT("current"));
-
-            float Reward = UMeshComparator::ComputeSimilarity(OriginalPath, CurrentPath);
-
-            TSharedPtr<FJsonObject> RespJson = MakeShareable(new FJsonObject);
-            RespJson->SetNumberField(TEXT("reward"), Reward);
-            FString RespStr;
-            TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&RespStr);
-            FJsonSerializer::Serialize(RespJson.ToSharedRef(), Writer);
-
-            FHttpServerResponse Resp;
-            Resp.Code = EHttpServerResponseCodes::Ok;
-            Resp.Body = TCHAR_TO_UTF8(*RespStr);
-            Resp.Headers.Add(TEXT("Content-Type"), {TEXT("application/json")});
-            OnComplete(MakeUnique<FHttpServerResponse>(MoveTemp(Resp)));
-            return true;
-        });
-
-    Server.Start(Port);
-}
-```
-
-`UMeshComparator::ComputeSimilarity` is the meat: import both OBJs into
-`ProceduralMeshComponent`s, render each from 6 fixed cameras to 512x512
-`UTextureRenderTarget2D`, read pixels back, compute similarity (start MSE/SSIM,
-upgrade to LPIPS later), return a float. See section 6 for the VRAM settings it
-must respect.
-
-### DefaultEngine.ini (VRAM + headless guards)
-
-```ini
-[SystemSettings]
-r.Shadow.MaxResolution=512
-r.TextureStreaming=True
-r.Streaming.PoolSize=2048
-r.Lumen.ScreenProbeGather.TracingOctahedronResolution=8
-r.Nanite.Enabled=False
-r.RayTracing=False
-r.AntiAliasingMethod=0
-r.RenderTargetViewportSize=512
-```
-
----
-
-## 4. Run the service + call it from automesh
-
-### Start the persistent service (once per training run)
-
-```bash
-# Shared volume: automesh writes OBJs here, UE reads them. Same box, no network copy.
-mkdir -p /shared/automesh_reward
-
-xvfb-run -a -s "-screen 0 1280x720x24" \
-  $UE_EDITOR /abs/AutoMeshRender/AutoMeshRender.uproject \
-  -game -RenderOffScreen -NoLoadStartupPackages -Unattended \
-  -NoSplash -NoPause -windowed -resx=1 -resy=1 \
-  -RenderServicePort=8765
-# listens on 127.0.0.1:8765, stays up for the whole run
-```
-
-### Wire it into the training loop
-
-```python
-from automesh.rewards import HttpRenderReward
-
-ue_reward = HttpRenderReward(
-    endpoint="http://127.0.0.1:8765/reward",
-    interval=100,          # sparse: only every 100 steps
-    weight=1.0,
-    timeout_seconds=30.0,  # warm call should be tens of ms; 30s is a safety net
-    shared_dir="/shared/automesh_reward",  # volume both processes can read
-)
-```
-
-`HttpRenderReward` writes `orig_<step>.obj` / `curr_<step>.obj` into
-`shared_dir`, POSTs the paths, and scales the returned float by `weight`.
-Because the service is warm, `timeout_seconds` can drop from 300s (subprocess)
-to 30s.
-
----
-
-## 5. Sanity checks (before training)
-
-```bash
-# 1. Service is up and answering.
-curl -s -X POST http://127.0.0.1:8765/reward \
-  -H 'Content-Type: application/json' \
-  -d '{"original":"/shared/automesh_reward/orig_0.obj",
-       "current":"/shared/automesh_reward/curr_0.obj","step":0,"faces":0}'
-# Expect: {"reward": <float>}
-
-# 2. End-to-end from Python with the real class.
-python - <<'PY'
-from automesh.rewards import HttpRenderReward
-from automesh.mesh import Mesh
-r = HttpRenderReward(endpoint="http://127.0.0.1:8765/reward",
-                     interval=1, shared_dir="/shared/automesh_reward")
-# build a RewardContext and call r(ctx) to confirm the full path
-print("client ready")
-PY
-```
-
----
-
-## 6. VRAM budget (8-16GB)
-
-| Resource | Default | Reward service | Notes |
-|---|---|---|---|
-| Render target | 1080p | **512x512** | 6 views = trivial |
-| Shadow maps | 2k | **512** | `r.Shadow.MaxResolution=512` |
-| Texture pool | 1GB | **2GB** | `r.Streaming.PoolSize=2048` |
-| Lumen | on | **off** | 4-6GB alone |
-| Nanite | on | **off** | Incompatible with OBJ import |
-| Ray tracing | off | off | confirmed off |
-
-Because the service is persistent, the DDC/shader cache warms up once during
-the first few reward calls and then stays warm — there is no per-call
-cold-start. If the very first call is slow, let it finish once; subsequent
-calls reuse compiled shaders.
-
----
-
-## 7. Iteration tips
-
-- **stdout discipline**: UE_LOG goes to the editor log, not stdout. Only the
-  HTTP response body carries the reward, so `HttpRenderReward` parsing is clean.
-- **OBJ import**: `ProceduralMeshComponent`, no material slots, no UVs. The
-  reward cares about silhouette/depth/normal, not textures.
-- **Camera matrices**: cache them in the service at startup; don't recompute
-  per call.
-- **Shared volume is the contract**: both processes must see the same
-  `/shared/automesh_reward`. On a single box this is just a local dir; if you
-  later go cross-box, switch to NFS or serialize the mesh into the body.
-- **Failure isolation**: a bad mesh that crashes the comparator should be
-  caught inside the service and returned as HTTP 500, not propagated to kill
-  the training process. `HttpRenderReward` will raise on non-2xx, so prefer to
-  catch-and-500 inside the service for known-bad inputs and reserve hard
-  crashes for truly unexpected state.
-
----
-
-## 8. What this unblocks in the roadmap
-
 - **M4 (Sparse Photoreal Reward)**: `HttpRenderReward` now has a real backend.
   Replace `PhotorealRewardStub` with the UE service wired as in section 4.
-- **M5 (Evaluation)**: add a `GET /render?mesh=<path>&view=<n>` route to the
-  same service to export paper figures, reusing the warm renderer.
+- **M5 (Evaluation)**: the `POST /render` route is already live — it takes
+  `{"obj": <obj text>, "width": 1024, "height": 1024}` and returns a PNG of a
+  single auto-framed 3/4 view. Drive it from `automesh render-image in.obj
+  out.png --endpoint http://127.0.0.1:8765/render` to export paper figures,
+  reusing the warm renderer (no separate cook/packaging step).

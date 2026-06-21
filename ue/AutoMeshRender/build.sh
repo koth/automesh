@@ -4,16 +4,15 @@
 # Usage:
 #   ./build.sh /path/to/UE5
 #   ./build.sh /path/to/UE5 --config Debug
-#   ./build.sh /path/to/UE5 --target ShaderCompileWorker  # build an engine target
 #
 # The UE path must contain Engine/Build/BatchFiles/Linux/Build.sh (UBT wrapper).
-# By default builds the AutoMeshRender Game target in Development, which matches
-# the engine config required by docs/UNREAL_SETUP.md. Output:
-#   ue/AutoMeshRender/Binaries/Linux/AutoMeshRender
+# By default builds the AutoMeshRenderEditor target (Editor, uncooked dev runs),
+# producing libUnrealEditor-AutoMeshRender.so. The Game target
+# (AutoMeshRender.Target.cs) is cooked-only and not used in development.
 set -euo pipefail
 
 CONFIG="Development"
-TARGET="AutoMeshRender"
+TARGET="AutoMeshRenderEditor"
 EXTRA_ARGS=()
 
 usage() {
@@ -25,7 +24,8 @@ Usage: $0 <UE_ROOT> [options]
 Options:
   --config CFG      Build config. Default: Development. (Do NOT use Shipping —
                     it drops runtime-module support the service relies on.)
-  --target NAME     Target name. Default: AutoMeshRender.
+  --target NAME     Target name. Default: AutoMeshRenderEditor (Editor target,
+                    produces libUnrealEditor-AutoMeshRender.so for uncooked runs).
                     Pass an engine target (e.g. ShaderCompileWorker) WITHOUT
                     --project to build engine helper binaries.
   --no-project      Do not pass -Project= (for engine targets).
@@ -96,6 +96,7 @@ if [[ "${NO_PROJECT:-0}" != "1" ]]; then
     echo "error: target file not found: $TARGET_CS" >&2
     echo "       Expected ${TARGET}.Target.cs in Source/ (next to the module dir)" >&2
     echo "       Rule: file Xxx.Target.cs -> class XxxTarget -> target name Xxx" >&2
+    echo "       Available project targets: AutoMeshRenderEditor (Editor/dev, default), AutoMeshRender (Game/cooked)" >&2
     exit 2
   fi
 fi
@@ -124,18 +125,20 @@ if [[ $RC -ne 0 ]]; then
   echo "error: build failed (exit $RC)" >&2
   echo "       Common causes:" >&2
   echo "       - include/type errors in MeshComparator.cpp or RenderService.cpp" >&2
-  echo "         (see ue/AutoMeshRender/README.md §Known compile-risk points)" >&2
+  echo "         (see ue/AutoMeshRender/README.md §API notes for verified UE5.4 APIs)" >&2
   echo "       - engine built as Shipping; rebuild engine as Development" >&2
   echo "       - for engine targets (ShaderCompileWorker etc.) pass --no-project" >&2
   exit $RC
 fi
 
-BINARY="$SCRIPT_DIR/Binaries/Linux/$TARGET"
-if [[ -f "$BINARY" ]]; then
-  echo "==> OK: $BINARY"
+# Editor targets produce a .so; Game/engine targets produce an executable.
+if [[ -f "$SCRIPT_DIR/Binaries/Linux/libUnrealEditor-${TARGET}.so" ]]; then
+  echo "==> OK: $SCRIPT_DIR/Binaries/Linux/libUnrealEditor-${TARGET}.so"
+elif [[ -f "$SCRIPT_DIR/Binaries/Linux/$TARGET" ]]; then
+  echo "==> OK: $SCRIPT_DIR/Binaries/Linux/$TARGET"
 else
-  echo "==> build returned success but binary not found at $BINARY" >&2
-  echo "    (some targets produce no binary; this is fine for e.g. UnrealPak)" >&2
+  echo "==> build returned success but no product found in Binaries/Linux/" >&2
+  echo "    (engine targets like UnrealPak may not produce one here; this is fine)" >&2
 fi
 echo
 echo "Next: runtime verification — see ue/AutoMeshRender/README.md §Run / §Verify"
