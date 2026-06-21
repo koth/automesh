@@ -151,8 +151,9 @@ These were resolved by reading the actual engine headers on the build host:
 - `IMPLEMENT_PRIMARY_GAME_MODULE` (not `IMPLEMENT_MODULE`) for the primary game module.
 - UE disables C++ exceptions — no try/catch; report errors via out-params.
 - PNG encoding: `IImageWrapperModule` (module name `ImageWrapper`, added to
-  `Build.cs` Private deps) → `FindOrCreateImageWrapper(EImageFormat::PNG)` →
-  `SetRaw(Data, Size, W, H, ERGBFormat::BGRA, 8)` (FColor is BGRA in memory) →
-  `GetCompressed(EImageCompressionQuality::Default)` returns the PNG bytes.
+  `Build.cs` Private deps) → `CreateImageWrapper(EImageFormat::PNG)` (note: it's
+  `Create`, not `FindOrCreate`, in 5.4) → `SetRaw(Data, Size, W, H,
+  ERGBFormat::BGRA, 8)` (FColor is BGRA in memory) → `GetCompressed(0)` returns a
+  `TArray64<uint8>` (int32 quality arg; copy by pointer+count into `TArray<uint8>`).
 - `/render` capture source is `SCS_FinalColorLDR` (final colour, not depth);
   `/reward` uses `SCS_SceneDepth`. Both reuse `USceneCaptureComponent2D`.

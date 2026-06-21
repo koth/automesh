@@ -331,7 +331,7 @@ static bool EncodePng(const TArray<FColor>& Pixels, int32 Width, int32 Height,
 	}
 
 	IImageWrapperModule& ImageWrapperModule = FModuleManager::LoadModuleChecked<IImageWrapperModule>(FName("ImageWrapper"));
-	TSharedPtr<IImageWrapper> PngWrapper = ImageWrapperModule.FindOrCreateImageWrapper(EImageFormat::PNG);
+	TSharedPtr<IImageWrapper> PngWrapper = ImageWrapperModule.CreateImageWrapper(EImageFormat::PNG);
 	if (!PngWrapper.IsValid())
 	{
 		OutError = TEXT("PNG image wrapper unavailable");
@@ -346,8 +346,18 @@ static bool EncodePng(const TArray<FColor>& Pixels, int32 Width, int32 Height,
 		return false;
 	}
 
-	OutBytes = PngWrapper->GetCompressed(EImageCompressionQuality::Default);
-	return OutBytes.Num() > 0;
+	// GetCompressed returns TArray64<uint8> (64-bit count) and takes an int32
+	// quality (0 = default). Copy into OutBytes (TArray<uint8>) by pointer+count;
+	// a direct assign would slice the 64-bit size type.
+	TArray64<uint8> Compressed = PngWrapper->GetCompressed(0);
+	if (Compressed.Num() <= 0)
+	{
+		OutError = TEXT("PNG compression produced no bytes");
+		return false;
+	}
+	OutBytes.Reset(static_cast<int32>(Compressed.Num()));
+	OutBytes.Append(reinterpret_cast<const uint8*>(Compressed.GetData()), static_cast<int32>(Compressed.Num()));
+	return true;
 }
 
 bool MeshComparator::RenderMeshToPng(const FString& ObjText,
