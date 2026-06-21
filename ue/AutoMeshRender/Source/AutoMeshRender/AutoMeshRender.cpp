@@ -3,7 +3,11 @@
 #include "RenderService.h"
 #include "Misc/CoreDelegates.h"
 
-IMPLEMENT_MODULE(FAutoMeshRenderModule, AutoMeshRender)
+// Game target primary module — must be IMPLEMENT_PRIMARY_GAME_MODULE (not
+// IMPLEMENT_MODULE) so the engine links the startup stack (GForeignEngineDir,
+// StdRealloc, etc.) into this executable. Third arg must match the module name
+// in AutoMeshRender.Build.cs / .uproject.
+IMPLEMENT_PRIMARY_GAME_MODULE(FAutoMeshRenderModule, AutoMeshRender, "AutoMeshRender");
 
 void FAutoMeshRenderModule::StartupModule()
 {
