@@ -82,7 +82,14 @@ static bool ParseObj(const FString& Path, TArray<FVector>& OutVerts, TArray<int3
 			TArray<int32> Idx;
 			for (int32 i = 1; i < Parts.Num(); ++i)
 			{
-				FString V = Parts[i].Split(TEXT("/")).Key;
+				// Index tokens may be v, v/vt, v//vn, or v/vt/vn. Take the part
+				// before the first '/'. FString::Split writes via out-params.
+				FString V = Parts[i];
+				FString Left, Right;
+				if (Parts[i].Split(TEXT("/"), &Left, &Right))
+				{
+					V = Left;
+				}
 				if (!V.IsEmpty())
 				{
 					int32 v = FCString::Atoi(*V);
