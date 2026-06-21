@@ -16,11 +16,36 @@
 #include "Serialization/JsonWriter.h"
 #include "Misc/CommandLine.h"
 #include "Misc/Parse.h"
+#include "Async/Async.h"
+#include "HAL/Event.h"
+#include "Misc/ScopeExit.h"
 
 static bool bStarted = false;
 static FHttpRouteHandle RewardRouteHandle = nullptr;
 static FHttpRouteHandle RenderRouteHandle = nullptr;
 static TSharedPtr<IHttpRouter> Router;
+
+// Run `Work` on the game thread synchronously. The HTTPServer module invokes
+// route handlers on its own listener thread; SpawnActor / CaptureScene /
+// GetRenderTargetResource all require the game thread, and calling them from
+// the listener thread crashes with `check(RenderTargetResource)` (or similar
+// engine asserts) because the RT was never given a chance to initialize.
+static void RunOnGameThread(TFunction<void()> Work)
+{
+	if (IsInGameThread())
+	{
+		Work();
+		return;
+	}
+	FEvent* Done = FPlatformProcess::GetSynchEventFromPool(false);
+	ON_SCOPE_EXIT { FPlatformProcess::ReturnSynchEventToPool(Done); };
+	AsyncTask(ENamedThreads::GameThread, [Work = MoveTemp(Work), Done]()
+	{
+		Work();
+		Done->Trigger();
+	});
+	Done->Wait();
+}
 
 int32 RenderService::GetPortFromArgs()
 {
@@ -102,29 +127,31 @@ void RenderService::Start(int32 Port)
 				return true;
 			}
 
-			// Render + compare synchronously on the request thread. Acceptable at
-			// interval=100; if it ever stalls, wrap in AsyncTask to the render
-			// thread and return a deferred response.
-			// UE disables C++ exceptions by default, so no try/catch — ComputeSimilarity
-			// reports failures via OutError (empty = success).
-			float Reward = 0.0f;
-			FString Error;
-			Reward = MeshComparator::ComputeSimilarity(OriginalObjText, CurrentObjText, Error);
-			bool bOk = Error.IsEmpty();
-
-			TSharedPtr<FJsonObject> RespJson = MakeShareable(new FJsonObject);
-			RespJson->SetNumberField(TEXT("reward"), Reward);
-			if (!bOk)
+			// Render + compare on the game thread — SpawnActor / CaptureScene
+			// require it; calling them from the HTTPServer listener thread crashes.
+			// UE disables C++ exceptions by default, so no try/catch —
+			// ComputeSimilarity reports failures via OutError (empty = success).
+			RunOnGameThread([OriginalObjText, CurrentObjText, OnComplete]()
 			{
-				RespJson->SetStringField(TEXT("error"), Error);
-			}
-			// Always return HTTP 200 with the error in the JSON body — the exact
-			// EHttpServerResponseCodes error enum value names vary across UE5
-			// builds, and HttpRenderReward only reads the JSON "reward" field
-			// anyway (it raises on non-2xx, so a 200-with-error is safer for
-		// debugging a misbehaving comparator than killing the training step).
-			EHttpServerResponseCodes Code = EHttpServerResponseCodes::Ok;
-			Respond(OnComplete, Code, BuildJsonResponse(RespJson.ToSharedRef()));
+				float Reward = 0.0f;
+				FString Error;
+				Reward = MeshComparator::ComputeSimilarity(OriginalObjText, CurrentObjText, Error);
+				bool bOk = Error.IsEmpty();
+
+				TSharedPtr<FJsonObject> RespJson = MakeShareable(new FJsonObject);
+				RespJson->SetNumberField(TEXT("reward"), Reward);
+				if (!bOk)
+				{
+					RespJson->SetStringField(TEXT("error"), Error);
+				}
+				// Always return HTTP 200 with the error in the JSON body — the exact
+				// EHttpServerResponseCodes error enum value names vary across UE5
+				// builds, and HttpRenderReward only reads the JSON "reward" field
+				// anyway (it raises on non-2xx, so a 200-with-error is safer for
+				// debugging a misbehaving comparator than killing the training step).
+				EHttpServerResponseCodes Code = EHttpServerResponseCodes::Ok;
+				Respond(OnComplete, Code, BuildJsonResponse(RespJson.ToSharedRef()));
+			});
 			return true;
 		}));
 
@@ -162,18 +189,22 @@ void RenderService::Start(int32 Port)
 			Body->TryGetNumberField(TEXT("width"), Width);
 			Body->TryGetNumberField(TEXT("height"), Height);
 
-			TArray<uint8> PngBytes;
-			FString Error;
-			bool bOk = MeshComparator::RenderMeshToPng(ObjText, Width, Height, PngBytes, Error);
-			if (!bOk)
+			// Render + PNG encode on the game thread — same reason as /reward.
+			RunOnGameThread([ObjText, Width, Height, OnComplete]()
 			{
-				TSharedPtr<FJsonObject> ErrJson = MakeShareable(new FJsonObject);
-				ErrJson->SetStringField(TEXT("error"), Error);
-				Respond(OnComplete, EHttpServerResponseCodes::Ok, BuildJsonResponse(ErrJson.ToSharedRef()));
-				return true;
-			}
+				TArray<uint8> PngBytes;
+				FString Error;
+				bool bOk = MeshComparator::RenderMeshToPng(ObjText, Width, Height, PngBytes, Error);
+				if (!bOk)
+				{
+					TSharedPtr<FJsonObject> ErrJson = MakeShareable(new FJsonObject);
+					ErrJson->SetStringField(TEXT("error"), Error);
+					Respond(OnComplete, EHttpServerResponseCodes::Ok, BuildJsonResponse(ErrJson.ToSharedRef()));
+					return;
+				}
 
-			RespondBytes(OnComplete, EHttpServerResponseCodes::Ok, MoveTemp(PngBytes), TEXT("image/png"));
+				RespondBytes(OnComplete, EHttpServerResponseCodes::Ok, MoveTemp(PngBytes), TEXT("image/png"));
+			});
 			return true;
 		}));
 
