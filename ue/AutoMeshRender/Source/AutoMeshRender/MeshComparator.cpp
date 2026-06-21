@@ -6,6 +6,7 @@
 #include "ProceduralMeshComponent.h"
 #include "KismetProceduralMeshLibrary.h"
 #include "Materials/Material.h"
+#include "MaterialDomain.h"
 #include "Components/SceneCaptureComponent2D.h"
 #include "UObject/ConstructorHelpers.h"
 #include "Misc/FileHelper.h"
@@ -197,7 +198,6 @@ static bool RenderViews(const TArray<FFixedCamera, TFixedAllocator<6>>& Cameras,
 	Capture->CaptureSource = ESceneCaptureSource::SCS_SceneDepth;
 	Capture->bCaptureEveryFrame = false;
 	Capture->bCaptureOnMovement = false;
-	Capture->ShowFlags.SetDepthOnlyTest(true);
 
 	for (int32 i = 0; i < Cameras.Num(); ++i)
 	{
