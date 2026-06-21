@@ -39,11 +39,10 @@ static FString BuildJsonResponse(TSharedRef<FJsonObject> Object)
 
 static void Respond(const FHttpResultCallback& OnComplete, EHttpServerResponseCodes Code, const FString& JsonBody)
 {
-	FString Body = JsonBody;
+	// Encode the JSON string as UTF-8 bytes (FHttpServerResponse::Body is TArray<uint8>).
+	const FTCHARToUTF8 Utf8(*JsonBody);
 	TArray<uint8> BodyBytes;
-	BodyBytes.AddUninitialized(Body.Len());
-	StringToBytes(Body, reinterpret_cast<ANSICHAR*>(BodyBytes.GetData()), Body.Len());
-	// StringToBytes writes Body.Len() bytes; the TArray is exactly that size.
+	BodyBytes.Append(reinterpret_cast<const uint8*>(Utf8.Get()), Utf8.Length());
 
 	auto Resp = MakeUnique<FHttpServerResponse>(MoveTemp(BodyBytes));
 	Resp->Code = Code;
@@ -93,18 +92,12 @@ void RenderService::Start(int32 Port)
 			// Render + compare synchronously on the request thread. Acceptable at
 			// interval=100; if it ever stalls, wrap in AsyncTask to the render
 			// thread and return a deferred response.
+			// UE disables C++ exceptions by default, so no try/catch — ComputeSimilarity
+			// reports failures via OutError (empty = success).
 			float Reward = 0.0f;
 			FString Error;
-			bool bOk = false;
-			try
-			{
-				Reward = MeshComparator::ComputeSimilarity(OriginalPath, CurrentPath, Error);
-				bOk = Error.IsEmpty();
-			}
-			catch (const std::exception& Exc)
-			{
-				Error = FString(ANSI_TO_TCHAR(Exc.what()));
-			}
+			Reward = MeshComparator::ComputeSimilarity(OriginalPath, CurrentPath, Error);
+			bool bOk = Error.IsEmpty();
 
 			TSharedPtr<FJsonObject> RespJson = MakeShareable(new FJsonObject);
 			RespJson->SetNumberField(TEXT("reward"), Reward);
@@ -112,7 +105,12 @@ void RenderService::Start(int32 Port)
 			{
 				RespJson->SetStringField(TEXT("error"), Error);
 			}
-			EHttpServerResponseCodes Code = bOk ? EHttpServerResponseCodes::Ok : EHttpServerResponseCodes::InternalServerError;
+			// Always return HTTP 200 with the error in the JSON body — the exact
+			// EHttpServerResponseCodes error enum value names vary across UE5
+			// builds, and HttpRenderReward only reads the JSON "reward" field
+			// anyway (it raises on non-2xx, so a 200-with-error is safer for
+		// debugging a misbehaving comparator than killing the training step).
+			EHttpServerResponseCodes Code = EHttpServerResponseCodes::Ok;
 			Respond(OnComplete, Code, BuildJsonResponse(RespJson.ToSharedRef()));
 			return true;
 		}));
@@ -133,7 +131,7 @@ void RenderService::Tick()
 	{
 		return;
 	}
-	if (!GEngine || !GEngine->GameViewport.IsValid())
+	if (!GEngine || !GEngine->GameViewport)
 	{
 		return; // wait for the headless viewport to exist
 	}

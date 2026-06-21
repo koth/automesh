@@ -157,7 +157,7 @@ static AActor* SpawnMeshActor(UObject* WorldContext, const TArray<FVector>& Vert
 static bool RenderViews(const TArray<FFixedCamera, TFixedAllocator<6>>& Cameras,
                         const FVector& BoundsCenter, float BoundsRadius,
                         const TArray<AActor*>& Actors,
-                        TArray<TArray<FLinearColor>>& OutPerViewPixels,
+                        TArray<TArray<FColor>>& OutPerViewPixels,
                         FString& OutError)
 {
 	const int32 Res = 512;
@@ -213,20 +213,16 @@ static bool RenderViews(const TArray<FFixedCamera, TFixedAllocator<6>>& Cameras,
 		// Capture. bUseRayTracingIfEnabled stays false because RT is off.
 		Capture->CaptureScene();
 
-		TArray<FLinearColor> Pixels;
+		TArray<FColor> Pixels;
 		FReadSurfaceDataFlags Flags(RCM_UNorm);
 		FlushRenderingCommands();
 		FRenderCommandFence Fence;
 		{
-			// NOTE(api): ReadSurfaceData must run on the render thread and needs
-			// an FRHICommandList. In 5.4 the most portable call is via the
-			// texture resource's own ReadSurfaceFloatData. If your toolchain
-			// only exposes ReadSurfaceData on a global immediate list, replace
-			// the block below with:
-			//   FRHICommandListExecutor::GetImmediateCommandList().ReadSurfaceData(...)
+			// ReadSurfaceData is on FRHICommandList (RHICommandList.h), must run
+			// on the render thread. Pixels are FColor (the FColor overload).
 			FTextureRenderTargetResource* RtRes = RT->GetRenderTargetResource();
 			ENQUEUE_RENDER_COMMAND(ReadDepthPixels)(
-				[RtRes, Res, Flags, &Pixels](FRHICommandList& RHICmdList)
+				[RtRes, Res, Flags, &Pixels](FRHICommandListImmediate& RHICmdList)
 			{
 				RHICmdList.ReadSurfaceData(
 					RtRes->TextureRHI,
@@ -245,8 +241,8 @@ static bool RenderViews(const TArray<FFixedCamera, TFixedAllocator<6>>& Cameras,
 	return true;
 }
 
-static float CompareBuffers(const TArray<TArray<FLinearColor>>& A,
-                             const TArray<TArray<FLinearColor>>& B)
+static float CompareBuffers(const TArray<TArray<FColor>>& A,
+                             const TArray<TArray<FColor>>& B)
 {
 	// 1 - normalised MSE over depth (alpha channel holds depth in SCS_SceneDepth).
 	// Keeps the metric bounded in [0,1] for an RL reward.
@@ -259,13 +255,13 @@ static float CompareBuffers(const TArray<TArray<FLinearColor>>& A,
 	int64 Count = 0;
 	for (int32 v = 0; v < A.Num(); ++v)
 	{
-		const TArray<FLinearColor>& Va = A[v];
-		const TArray<FLinearColor>& Vb = B[v];
+	const TArray<FColor>& Va = A[v];
+	const TArray<FColor>& Vb = B[v];
 		int32 N = FMath::Min(Va.Num(), Vb.Num());
 		for (int32 p = 0; p < N; ++p)
 		{
-			float Da = Va[p].R; // depth packed into R by SCS_SceneDepth + RGBA8
-			float Db = Vb[p].R;
+			float Da = Va[p].R / 255.0f; // FColor.R is uint8; normalise to [0,1]
+			float Db = Vb[p].R / 255.0f;
 			float Diff = Da - Db;
 			SumSq += Diff * Diff;
 			++Count;
@@ -308,7 +304,7 @@ float MeshComparator::ComputeSimilarity(const FString& OriginalObjPath,
 		return 0.0f;
 	}
 
-	TArray<TArray<FLinearColor>> OrigPixels, CurrPixels;
+	TArray<TArray<FColor>> OrigPixels, CurrPixels;
 	bool bOkA = RenderViews(Cams, Center, Radius, TArray<AActor*>{OrigActor}, OrigPixels, OutError);
 	bool bOkB = RenderViews(Cams, Center, Radius, TArray<AActor*>{CurrActor}, CurrPixels, OutError);
 
