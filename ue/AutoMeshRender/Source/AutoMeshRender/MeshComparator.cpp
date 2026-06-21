@@ -6,6 +6,7 @@
 #include "ProceduralMeshComponent.h"
 #include "KismetProceduralMeshLibrary.h"
 #include "Materials/Material.h"
+#include "Components/SceneCaptureComponent2D.h"
 #include "UObject/ConstructorHelpers.h"
 #include "Misc/FileHelper.h"
 #include "Misc/Paths.h"
@@ -140,9 +141,10 @@ static AActor* SpawnMeshActor(UObject* WorldContext, const TArray<FVector>& Vert
 	TArray<FVector2D> UV0;
 	TArray<FColor> Colors;
 	TArray<FProcMeshTangent> Tangents;
-	UKismetProceduralMeshLibrary::CalculateNormals(Verts, Tris, Normals);
+	// CalculateTangentsForMesh fills both Normals and Tangents; needs UVs (can be empty array).
+	UKismetProceduralMeshLibrary::CalculateTangentsForMesh(Verts, Tris, UV0, Normals, Tangents);
 	PMC->CreateMeshSection(0, Verts, Tris, Normals, UV0, Colors, Tangents, false);
-	PMC->SetMaterial(0, UMaterial::GetDefaultMaterial(MD_Surface));
+		PMC->SetMaterial(0, UMaterial::GetDefaultMaterial(EMaterialDomain::MD_Surface));
 	PMC->SetVisibility(true);
 
 	return Actor;
@@ -165,7 +167,7 @@ static bool RenderViews(const TArray<FFixedCamera, TFixedAllocator<6>>& Cameras,
 	// is the common 5.4 path; if InitAutoFormat is preferred on your build,
 	// swap to RT->InitAutoFormat(Res, Res) + RT->UpdateResourceImmediate(true).
 	RT->RenderTargetFormat = RTF_RGBA8;
-	RT->Init(Res, Res);
+	RT->InitAutoFormat(Res, Res);
 	RT->UpdateResourceImmediate(true);
 
 	OutPerViewPixels.SetNum(Cameras.Num());

@@ -1,7 +1,7 @@
 #include "AutoMeshRender.h"
 #include "Modules/ModuleManager.h"
 #include "RenderService.h"
-#include "Delegates/CoreDelegates.h"
+#include "Misc/CoreDelegates.h"
 
 IMPLEMENT_MODULE(FAutoMeshRenderModule, AutoMeshRender)
 
