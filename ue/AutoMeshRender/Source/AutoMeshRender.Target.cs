@@ -10,12 +10,5 @@ public class AutoMeshRenderTarget : TargetRules
 		Type = TargetType.Game;
 		DefaultBuildSettings = BuildSettingsVersion.V5;
 		ExtraModuleNames.Add("AutoMeshRender");
-		// We run a -game dev build with no packaged Content/. Without this, the
-		// engine calls FShaderCodeLibrary::InitForRuntime and fatal-errors on the
-		// missing Global shader pak. Disable the shader code library + pipeline
-		// cache + pak file so shaders load from source/disk instead.
-		bUseShaderCodeLibrary = false;
-		bUseShaderPipelineCache = false;
-		bUsePakFile = false;
 	}
 }
