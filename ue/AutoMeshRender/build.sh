@@ -89,10 +89,12 @@ fi
 
 # --- target file presence check (project targets only) ---
 if [[ "${NO_PROJECT:-0}" != "1" ]]; then
-  TARGET_CS="$SCRIPT_DIR/Source/AutoMeshRender/${TARGET}.Target.cs"
+  # Target files live in Source/ (NOT in the module dir), per UE convention —
+  # putting them in Source/AutoMeshRender/ causes CS0101 class-duplication.
+  TARGET_CS="$SCRIPT_DIR/Source/${TARGET}.Target.cs"
   if [[ ! -f "$TARGET_CS" ]]; then
     echo "error: target file not found: $TARGET_CS" >&2
-    echo "       Expected ${TARGET}.Target.cs in Source/AutoMeshRender/" >&2
+    echo "       Expected ${TARGET}.Target.cs in Source/ (next to the module dir)" >&2
     echo "       Rule: file Xxx.Target.cs -> class XxxTarget -> target name Xxx" >&2
     exit 2
   fi

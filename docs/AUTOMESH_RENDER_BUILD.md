@@ -43,7 +43,7 @@ test -f "$UBT" && echo "UBT ok" || echo "UBT missing — engine not built?"
 
 One command. UBT generates project files, compiles the `AutoMeshRender` module,
 and links the `AutoMeshRender` target defined in
-`Source/AutoMeshRender/AutoMeshRender.Target.cs` (`Type = Game`).
+`Source/AutoMeshRender.Target.cs` (`Type = Game`).
 
 ```bash
 "$UBT" AutoMeshRender Linux Development -Project="$PROJ" -WaitMutex
@@ -95,12 +95,16 @@ These are engine targets, so **do not** pass `-Project=`.
 Cause: `Target.cs` missing or class name mismatch. Verify:
 
 ```bash
-ls ue/AutoMeshRender/Source/AutoMeshRender/AutoMeshRender.Target.cs
-grep "class AutoMeshRenderTarget" ue/AutoMeshRender/Source/AutoMeshRender/AutoMeshRender.Target.cs
+ls ue/AutoMeshRender/Source/AutoMeshRender.Target.cs
+grep "class AutoMeshRenderTarget" ue/AutoMeshRender/Source/AutoMeshRender.Target.cs
 ```
 
 Rule: file `Xxx.Target.cs` → class `XxxTarget` → target name `Xxx`. All three
-must agree. Currently they're `AutoMeshRender.Target.cs` / `AutoMeshRenderTarget` / `AutoMeshRender`.
+must agree. **Target files live in `Source/` (not inside the module dir
+`Source/AutoMeshRender/`)** — putting them there causes CS0101 class duplication
+because UBT copies both Build.cs and Target.cs into the same Intermediate
+compilation unit. Currently they're `AutoMeshRender.Target.cs` /
+`AutoMeshRenderTarget` / `AutoMeshRender`.
 
 ### 4b. "No rule to make target" / `make` errors
 

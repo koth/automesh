@@ -33,8 +33,9 @@ export PROJ="/abs/automesh/ue/AutoMeshRender/AutoMeshRender.uproject"
 Notes:
 - `-Project=` is required so UBT uses this `.uproject` instead of the engine's.
 - If UBT complains the target doesn't exist, check that
-  `Source/AutoMeshRender/AutoMeshRender.Target.cs` is present (class name
-  `AutoMeshRenderTarget`, file name `AutoMeshRender.Target.cs`).
+  `Source/AutoMeshRender.Target.cs` is present (class name
+  `AutoMeshRenderTarget`, file name `AutoMeshRender.Target.cs`). It must live
+  in `Source/`, not inside the module dir — see `docs/AUTOMESH_RENDER_BUILD.md` §4a.
 - If it asks for a `Client`/`Server` target, you only have a Game target; that's
   intentional — the service runs with `-game`.
 
