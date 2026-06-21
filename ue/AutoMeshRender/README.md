@@ -64,6 +64,16 @@ Wait for `[AutoMeshRender] HTTP service listening on 127.0.0.1:8765/reward and /
 the log (first run spends a few minutes compiling shaders; subsequent runs are
 fast once the DDC is warm).
 
+## Bind address
+
+`FHttpListener` takes only a port; the bind address comes from
+`GConfig` key `[HTTPServer.Listeners] DefaultBindAddress`
+(`FHttpServerConfig::GetListenerConfig`). The engine default is `localhost`
+(127.0.0.1). This project overrides it in `Config/DefaultEngine.ini` to
+`0.0.0.0`, so `/reward` and `/render` are reachable from other hosts
+(firewall aside). Change it back to `localhost` if you want to lock the
+service to the local box only.
+
 ## Verify
 
 ```bash

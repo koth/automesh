@@ -166,6 +166,17 @@ It is a persistent UE5 module (not a per-call commandlet) that:
    mesh from one auto-framed 3/4 camera into a 1024² colour RT, and returns
    the PNG bytes (`Content-Type: image/png`).
 
+### Bind address (127.0.0.1 vs 0.0.0.0)
+
+`FHttpListener` only takes a port — the bind address comes from
+`GConfig` key `[HTTPServer.Listeners] DefaultBindAddress`
+(`FHttpServerConfig::GetListenerConfig` in `HttpServerConfig.h`). The engine
+default is `localhost` (127.0.0.1), so out of the box the service only
+accepts loopback connections. `Config/DefaultEngine.ini` in this repo
+overrides that to `0.0.0.0`, so `/reward` and `/render` are reachable from
+other hosts. To lock back down to loopback only, change it to `localhost`
+(or `127.0.0.1`).
+
 ### Project layout
 
 ```
