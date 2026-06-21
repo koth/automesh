@@ -113,11 +113,39 @@ static bool ParseObjFromString(const FString& ObjText, TArray<FVector>& OutVerts
 }
 
 // ---------------------------------------------------------------------------
+// World lookup. In an editor `-game` standalone session the render-thread and
+// request-thread see a Game world but no PlayerController, so `GetWorld()`
+// from any context object can come back null. Walk GEngine's world contexts
+// explicitly and prefer Game/PIE; fall back to Editor world only if no other.
+// ---------------------------------------------------------------------------
+static UWorld* GetServiceWorld()
+{
+	if (!GEngine)
+	{
+		return nullptr;
+	}
+	if (UWorld* PlayWorld = GEngine->GetCurrentPlayWorld())
+	{
+		return PlayWorld;
+	}
+	for (const FWorldContext& Ctx : GEngine->GetWorldContexts())
+	{
+		if (Ctx.WorldType == EWorldType::Game || Ctx.WorldType == EWorldType::PIE)
+		{
+			if (UWorld* W = Ctx.World())
+			{
+				return W;
+			}
+		}
+	}
+	return nullptr;
+}
+
+// ---------------------------------------------------------------------------
 // Build a ProceduralMeshComponent from parsed verts/tris. Returned actor owns it.
 // ---------------------------------------------------------------------------
-static AActor* SpawnMeshActor(UObject* WorldContext, const TArray<FVector>& Verts, const TArray<int32>& Tris)
+static AActor* SpawnMeshActor(UWorld* World, const TArray<FVector>& Verts, const TArray<int32>& Tris)
 {
-	UWorld* World = GEngine->GetWorldFromContextObject(WorldContext, EGetWorldErrorMode::LogAndReturnNull);
 	if (!World)
 	{
 		return nullptr;
@@ -292,9 +320,14 @@ float MeshComparator::ComputeSimilarity(const FString& OriginalObjText,
 
 	auto Cams = MakeCameras(Center, Radius * 3.0f);
 
-	UObject* WorldCtx = GetTransientPackage();
-	AActor* OrigActor = SpawnMeshActor(WorldCtx, OrigVerts, OrigTris);
-	AActor* CurrActor = SpawnMeshActor(WorldCtx, CurrVerts, CurrTris);
+	UWorld* World = GetServiceWorld();
+	if (!World)
+	{
+		OutError = TEXT("no world available to spawn mesh actors");
+		return 0.0f;
+	}
+	AActor* OrigActor = SpawnMeshActor(World, OrigVerts, OrigTris);
+	AActor* CurrActor = SpawnMeshActor(World, CurrVerts, CurrTris);
 	if (!OrigActor || !CurrActor)
 	{
 		OutError = TEXT("failed to spawn mesh actors");
@@ -380,8 +413,13 @@ bool MeshComparator::RenderMeshToPng(const FString& ObjText,
 	float Radius = Box.GetExtent().Size();
 	if (Radius < KINDA_SMALL_NUMBER) Radius = 1.0f;
 
-	UObject* WorldCtx = GetTransientPackage();
-	AActor* MeshActor = SpawnMeshActor(WorldCtx, Verts, Tris);
+	UWorld* World = GetServiceWorld();
+	if (!World)
+	{
+		OutError = TEXT("no world available to spawn mesh actor");
+		return false;
+	}
+	AActor* MeshActor = SpawnMeshActor(World, Verts, Tris);
 	if (!MeshActor)
 	{
 		OutError = TEXT("failed to spawn mesh actor");
