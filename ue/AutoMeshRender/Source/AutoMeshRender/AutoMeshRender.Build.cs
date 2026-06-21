@@ -17,7 +17,7 @@ public class AutoMeshRender : ModuleRules
 
 		PrivateDependencyModuleNames.AddRange(new string[]
 		{
-			"HTTPServer",
+			"HttpServer",
 			"JsonUtilities",
 			"Json",
 			"ProceduralMeshComponent",

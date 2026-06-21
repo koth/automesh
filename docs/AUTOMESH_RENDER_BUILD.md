@@ -118,7 +118,7 @@ APIs but not compiled here. Most likely:
 
 - `#include "SceneCaptureComponent2D.h"` path → try `Components/SceneCaptureComponent2D.h`
 - `#include "KismetProceduralMeshLibrary.h"` → try `Kismet/KismetProceduralMeshLibrary.h`
-- `FHttpRouteHandler` / `EHttpServerRequestVerbs` → HTTPServer plugin API shift
+- `FHttpRouteHandler` / `EHttpServerRequestVerbs` → `HttpServer` engine module API shift
 - `ReadSurfaceData` signature → render-thread read API
 
 Fix path: change the include to the full module-prefixed path UBT reports in the
@@ -127,16 +127,14 @@ error (e.g. `Components/SceneCaptureComponent2D.h`), or add the module to
 from a module not yet depended on. See `ue/AutoMeshRender/README.md` §"Known
 compile-risk points" for the full list.
 
-### 4d. "module HTTPServer not found"
+### 4d. "module HTTPServer/HttpServer not found"
 
-The `.uproject` enables the plugin, but on some engine builds you also need it
-as a build dependency. Add to `AutoMeshRender.Build.cs` `PrivateDependencyModuleNames`:
-
-```csharp
-"HTTPServer",
-```
-
-(It's already there; this is the fix if it somehow gets removed.)
+`HttpServer` is an **engine module, not a plugin** — do NOT list it under
+`.uproject` `Plugins` (that triggers "Unable to find plugin 'HTTPServer'").
+It is declared as a build dependency in `AutoMeshRender.Build.cs`
+`PrivateDependencyModuleNames` (already present). If UBT still can't find the
+module, check the spelling: the module is `HttpServer` (mixed case), and the
+include is `#include "HttpServerModule.h"`.
 
 ### 4e. Mixed config link errors
 

@@ -15,15 +15,5 @@
 				"RHI"
 			]
 		}
-	],
-	"Plugins": [
-		{
-			"Name": "HTTPServer",
-			"Enabled": true
-		},
-		{
-			"Name": "JsonUtilities",
-			"Enabled": true
-		}
 	]
 }

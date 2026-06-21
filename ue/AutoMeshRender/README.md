@@ -83,7 +83,8 @@ on your machine:
    `SCS_FinalColorLDR` alpha.
 
 4. **`RenderService.cpp` — `FHttpRouteHandler` / `EHttpServerRequestVerbs`**.
-   These live in the `HTTPServer` plugin (enabled in `.uproject`). The lambda
+   These live in the `HttpServer` engine module (a build dependency in
+   `AutoMeshRender.Build.cs`, NOT a `.uproject` plugin — it ships with the engine). The lambda
    signature `(const FHttpServerRequest&, const FHttpResultCallback&)` is the
    5.3+ form; older builds used a delegate. If `AddRoute` rejects it, switch to
    `Server.OnRequest().AddRaw(...)` style.
