@@ -197,6 +197,9 @@ static bool RenderViews(const TArray<FFixedCamera, TFixedAllocator<6>>& Cameras,
 	RT->RenderTargetFormat = RTF_RGBA8;
 	RT->InitAutoFormat(Res, Res);
 	RT->UpdateResourceImmediate(true);
+	// RT resource creation is queued onto the render thread; block until it
+	// actually exists, otherwise GetRenderTargetResource() asserts null.
+	FlushRenderingCommands();
 
 	OutPerViewPixels.SetNum(Cameras.Num());
 
@@ -240,27 +243,29 @@ static bool RenderViews(const TArray<FFixedCamera, TFixedAllocator<6>>& Cameras,
 		// Capture. bUseRayTracingIfEnabled stays false because RT is off.
 		Capture->CaptureScene();
 
-		TArray<FColor> Pixels;
-		FReadSurfaceDataFlags Flags(RCM_UNorm);
-		FlushRenderingCommands();
-		FRenderCommandFence Fence;
+		// ReadPixels is the game-thread-safe high-level wrapper: it internally
+		// marshals to the render thread, blocks until the readback is complete,
+		// and fills `Pixels` with FColor data. Much safer than rolling our own
+		// ENQUEUE_RENDER_COMMAND + FRenderCommandFence + RHICmdList.ReadSurfaceData
+		// (which is what bit us with `GetRenderTargetResource()` returning null — not
+		// synchronizing after `UpdateResourceImmediate` meant the RT resource wasn't
+		// created yet, and the listener thread couldn't drive the render thread).
+		FTextureRenderTargetResource* RtRes = RT->GameThread_GetRenderTargetResource();
+		if (!RtRes)
 		{
-			// ReadSurfaceData is on FRHICommandList (RHICommandList.h), must run
-			// on the render thread. Pixels are FColor (the FColor overload).
-			FTextureRenderTargetResource* RtRes = RT->GetRenderTargetResource();
-			ENQUEUE_RENDER_COMMAND(ReadDepthPixels)(
-				[RtRes, Res, Flags, &Pixels](FRHICommandListImmediate& RHICmdList)
-			{
-				RHICmdList.ReadSurfaceData(
-					RtRes->TextureRHI,
-					FIntRect(0, 0, Res - 1, Res - 1),
-					Pixels,
-					Flags);
-			});
+			OutError = TEXT("render target resource unavailable after CaptureScene");
+			return false;
 		}
-		Fence.BeginFence();
-		Fence.Wait();
-
+		TArray<FColor> Pixels;
+		FReadSurfaceDataFlags Flags;
+		Flags.SetLinearToGamma(false);
+		RtRes->ReadPixels(Pixels, Flags);
+		if (Pixels.Num() != Res * Res)
+		{
+			OutError = FString::Printf(TEXT("ReadPixels returned %d pixels, expected %d"),
+			                            Pixels.Num(), Res * Res);
+			return false;
+		}
 		OutPerViewPixels[i] = MoveTemp(Pixels);
 	}
 
@@ -451,6 +456,9 @@ bool MeshComparator::RenderMeshToPng(const FString& ObjText,
 	RT->RenderTargetFormat = RTF_RGBA8;
 	RT->InitAutoFormat(Width, Height);
 	RT->UpdateResourceImmediate(true);
+	// RT resource creation is queued onto the render thread; block until it
+	// actually exists, otherwise GetRenderTargetResource() asserts null.
+	FlushRenderingCommands();
 
 	AActor* CaptureActor = World->SpawnActor<AActor>(AActor::StaticClass());
 	USceneCaptureComponent2D* Capture = NewObject<USceneCaptureComponent2D>(CaptureActor);
@@ -468,24 +476,26 @@ bool MeshComparator::RenderMeshToPng(const FString& ObjText,
 	Capture->ClipPlaneNormal = FVector::ZeroVector; // disable custom clip
 	Capture->CaptureScene();
 
-	TArray<FColor> Pixels;
-	FReadSurfaceDataFlags Flags(RCM_UNorm);
-	FlushRenderingCommands();
-	FRenderCommandFence Fence;
+	// Same pattern as /reward: use the game-thread-safe ReadPixels wrapper
+	// instead of hand-rolling the render-thread readback.
+	FTextureRenderTargetResource* RtRes = RT->GameThread_GetRenderTargetResource();
+	if (!RtRes)
 	{
-		FTextureRenderTargetResource* RtRes = RT->GetRenderTargetResource();
-		ENQUEUE_RENDER_COMMAND(ReadRenderPixels)(
-			[RtRes, Width, Height, Flags, &Pixels](FRHICommandListImmediate& RHICmdList)
-		{
-			RHICmdList.ReadSurfaceData(
-				RtRes->TextureRHI,
-				FIntRect(0, 0, Width - 1, Height - 1),
-				Pixels,
-				Flags);
-		});
+		OutError = TEXT("render target resource unavailable after CaptureScene");
+		CaptureActor->Destroy();
+		return false;
 	}
-	Fence.BeginFence();
-	Fence.Wait();
+	TArray<FColor> Pixels;
+	FReadSurfaceDataFlags Flags;
+	Flags.SetLinearToGamma(false);
+	RtRes->ReadPixels(Pixels, Flags);
+	if (Pixels.Num() != Width * Height)
+	{
+		OutError = FString::Printf(TEXT("ReadPixels returned %d pixels, expected %d"),
+		                            Pixels.Num(), Width * Height);
+		CaptureActor->Destroy();
+		return false;
+	}
 
 	CaptureActor->Destroy();
 	MeshActor->Destroy();
