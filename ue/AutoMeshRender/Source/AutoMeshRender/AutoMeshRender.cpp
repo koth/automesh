@@ -1,22 +1,28 @@
 #include "AutoMeshRender.h"
 #include "Modules/ModuleManager.h"
 #include "RenderService.h"
+#include "CoreDelegates.h"
 
 IMPLEMENT_MODULE(FAutoMeshRenderModule, AutoMeshRender)
 
 void FAutoMeshRenderModule::StartupModule()
 {
-	// Defer until the engine has a valid world / renderer. On a headless -game
-	// run the GameViewport is created during engine init; we hook its ready
-	// delegate so the HTTP server starts only once rendering is up.
-	FCoreDelegates::OnEndFrame.AddStatic(&RenderService::Tick);
+	// Defer until the engine has a valid world / renderer. OnEndFrame fires
+	// every frame; Tick checks the viewport and starts the HTTP server once.
+	// We keep the returned handle because TMulticastDelegate<void()> has no
+	// RemoveStatic — only Remove(FDelegateHandle).
+	TickHandle = FCoreDelegates::OnEndFrame.AddStatic(&RenderService::Tick);
 
 	UE_LOG(LogTemp, Log, TEXT("[AutoMeshRender] module started; HTTP service will start on first frame with a viewport."));
 }
 
 void FAutoMeshRenderModule::ShutdownModule()
 {
-	FCoreDelegates::OnEndFrame.RemoveStatic(&RenderService::Tick);
+	if (TickHandle.IsValid())
+	{
+		FCoreDelegates::OnEndFrame.Remove(TickHandle);
+		TickHandle.Reset();
+	}
 	RenderService::Stop();
 	UE_LOG(LogTemp, Log, TEXT("[AutoMeshRender] module stopped."));
 }

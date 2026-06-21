@@ -1,6 +1,7 @@
 #pragma once
 
 #include "CoreMinimal.h"
+#include "Delegates/Delegate.h"
 
 /**
  * AutoMeshRender module: a persistent headless render service.
@@ -15,4 +16,7 @@ class FAutoMeshRenderModule : public IModuleInterface
 public:
 	virtual void StartupModule() override;
 	virtual void ShutdownModule() override;
+private:
+	/** Handle to the OnEndFrame delegate so we can remove it cleanly on shutdown. */
+	FDelegateHandle TickHandle;
 };
