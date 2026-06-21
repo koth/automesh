@@ -127,14 +127,16 @@ error (e.g. `Components/SceneCaptureComponent2D.h`), or add the module to
 from a module not yet depended on. See `ue/AutoMeshRender/README.md` §"Known
 compile-risk points" for the full list.
 
-### 4d. "module HTTPServer/HttpServer not found"
+### 4d. "module HTTPServer not found" / "Unable to find plugin 'HTTPServer'"
 
-`HttpServer` is an **engine module, not a plugin** — do NOT list it under
+`HTTPServer` is an **engine module, not a plugin** — do NOT list it under
 `.uproject` `Plugins` (that triggers "Unable to find plugin 'HTTPServer'").
 It is declared as a build dependency in `AutoMeshRender.Build.cs`
-`PrivateDependencyModuleNames` (already present). If UBT still can't find the
-module, check the spelling: the module is `HttpServer` (mixed case), and the
-include is `#include "HttpServerModule.h"`.
+`PrivateDependencyModuleNames` (already present as `"HTTPServer"`, matching the
+real engine directory `Engine/Source/Runtime/Online/HTTPServer/`). Module names
+are case-sensitive on Linux and MUST match the directory name exactly — it is
+`HTTPServer` (all caps), not `HttpServer`. The include is
+`#include "HttpServerModule.h"` (file name is mixed case, that's fine).
 
 ### 4e. Mixed config link errors
 
