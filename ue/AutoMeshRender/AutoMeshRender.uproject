@@ -1,0 +1,29 @@
+{
+	"FileVersion": 3,
+	"EngineAssociation": "5.4",
+	"Category": "",
+	"Description": "Persistent headless render service for automesh photoreal reward (M4).",
+	"Modules": [
+		{
+			"Name": "AutoMeshRender",
+			"Type": "Runtime",
+			"LoadingPhase": "Default",
+			"AdditionalDependencies": [
+				"Engine",
+				"CoreUObject",
+				"RenderCore",
+				"RHI"
+			]
+		}
+	],
+	"Plugins": [
+		{
+			"Name": "HTTPServer",
+			"Enabled": true
+		},
+		{
+			"Name": "JsonUtilities",
+			"Enabled": true
+		}
+	]
+}
