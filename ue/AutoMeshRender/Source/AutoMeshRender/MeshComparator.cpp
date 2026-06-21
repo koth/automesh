@@ -439,7 +439,6 @@ bool MeshComparator::RenderMeshToPng(const FString& ObjText,
 	FVector CamPos = Center + Dir * Dist;
 	FRotator CamRot = FRotationMatrix::MakeFromX(-Dir).Rotator();
 
-	UWorld* World = MeshActor->GetWorld();
 	if (!World)
 	{
 		OutError = TEXT("no world to render in");
